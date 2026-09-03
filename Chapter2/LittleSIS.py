@@ -16,22 +16,16 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 import networkx as nx
-import nltk
 import random
-from tqdm.notebook import trange, tqdm # Allows for real-time progress bar of simulations
-import pickle
+from tqdm.notebook import tqdm # Allows for real-time progress bar of simulations
 import gc
 from itertools import combinations
 import time
-from datetime import datetime
 import matplotlib.dates as mdates
 import matplotlib.ticker as ticker
 import matplotlib.gridspec as gridspec
 
-import json
-import gzip
 from collections import Counter
-import os
 
 import dionysus as d
 
@@ -41,21 +35,28 @@ import dionysus as d
 
 def missing_value_audit(data_dict, dict_name, attr_key='attributes'):
     """
-    For each attribute in a dictionary of entities or relationships,
-    compute the proportion of entries where that attribute is missing
-    (None, empty string, empty list, or empty dict).
+    Computes, for each attribute across a dictionary of entities or
+    relationships, the proportion of entries where that attribute is
+    missing (None, empty string, empty list, or empty dict), and
+    prints a formatted summary table.
 
     Parameters
     ----------
-    data_dict : dict, keyed by id
-    dict_name : str, name for display
-    attr_key  : str, the key within each entry that holds the attributes dict.
-                Pass None if the entries are already flat attribute dicts
-                (e.g. after preprocessing).
+    data_dict : dict
+      Entities or relationships, keyed by id.
+    dict_name : str
+      Name used in the printed summary header.
+    attr_key : str or None
+      Key within each entry that holds its attributes dict. Pass None
+      if entries are already flat attribute dicts (e.g. after
+      preprocessing).
 
     Returns
     -------
-    results : pd.DataFrame, sorted by missing proportion descending
+    df : pandas.DataFrame
+      One row per attribute, with columns 'attribute', 'total',
+      'n_missing', 'n_present', 'pct_missing', 'pct_present', sorted
+      by pct_missing descending.
     """
     from collections import defaultdict
 
@@ -123,8 +124,23 @@ def missing_value_audit(data_dict, dict_name, attr_key='attributes'):
 
 def plot_missing_audit(df, title, save_path=None):
     """
-    Plot missing value proportions as a horizontal bar chart,
-    sorted from most to least missing.
+    Plots missing-value proportions (see missing_value_audit) as a
+    horizontal bar chart, sorted from least to most missing.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+      Output of missing_value_audit, with 'attribute' and
+      'pct_missing' columns.
+    title : str
+      Plot title.
+    save_path : str or None
+      If given, the figure is saved to this path.
+
+    Returns
+    -------
+    None
+      Displays the figure; saves it to save_path if given.
     """
     df_plot = df.sort_values('pct_missing', ascending=True)
 
@@ -152,21 +168,94 @@ def plot_missing_audit(df, title, save_path=None):
     plt.show()
 
 def year_counts(years, bins):
+    """
+    Counts occurrences of each year, aligned to a set of bin edges.
+
+    Parameters
+    ----------
+    years : iterable of int
+      Year values to count.
+    bins : sequence of int
+      Bin edges; counts are reported for years bins[0]..bins[-2]
+      (the left edge of each bin except the last).
+
+    Returns
+    -------
+    ndarray
+      Count of years equal to each of bins[:-1], in order.
+    """
     c = Counter(years)
     return np.array([c.get(y, 0) for y in bins[:-1]])
 
 def extract_update_years(rel_dict):
+    """
+    Extracts the year component of each relationship's 'updated_at'
+    date, skipping relationships where it is missing.
+
+    Parameters
+    ----------
+    rel_dict : dict
+      LittleSIS relationship dicts, keyed by relationship id.
+
+    Returns
+    -------
+    list of int
+      One year per relationship with a non-null 'updated_at'.
+    """
     return [int(rel_dict[r]['updated_at'][:4]) for r in rel_dict
             if rel_dict[r]['updated_at'] is not None]
 
 def extract_start_years(rel_dict):
+    """
+    Extracts the year component of each relationship's 'start_date'.
+
+    Parameters
+    ----------
+    rel_dict : dict
+      LittleSIS relationship dicts, keyed by relationship id. Every
+      relationship is assumed to have a 'start_date'.
+
+    Returns
+    -------
+    list of int
+      One year per relationship.
+    """
     return [int(rel_dict[r]['start_date'][:4]) for r in rel_dict]
 
 def extract_end_years(rel_dict):
+    """
+    Extracts the year component of each relationship's 'end_date',
+    skipping relationships where it is missing (still ongoing).
+
+    Parameters
+    ----------
+    rel_dict : dict
+      LittleSIS relationship dicts, keyed by relationship id.
+
+    Returns
+    -------
+    list of int
+      One year per relationship with a non-null 'end_date'.
+    """
     return [int(rel_dict[r]['end_date'][:4]) for r in rel_dict
             if rel_dict[r]['end_date'] is not None]
 
 def extract_durations(rel_dict):
+    """
+    Computes the duration, in whole years, of each relationship that
+    has both a start and end date, discarding negative durations.
+
+    Parameters
+    ----------
+    rel_dict : dict
+      LittleSIS relationship dicts, keyed by relationship id.
+
+    Returns
+    -------
+    durations : list of int
+      Non-negative year durations, one per relationship with both
+      dates present.
+    """
     durations = []
     for r in rel_dict:
         s = rel_dict[r]['start_date']
@@ -180,23 +269,33 @@ def extract_durations(rel_dict):
 def GraphStats_LittleSIS(rel_dicts, sort_by='start_date', timing=False,
                           random_seed=42):
     """
-    Build a graph from LittleSIS relationship dicts by adding edges in date
-    order (ties broken randomly). Computes mean degree, max degree, and
-    average clustering coefficient at the end of each calendar year.
+    Builds a graph from LittleSIS relationship dicts by adding edges in
+    date order (ties broken randomly). Computes mean degree, max
+    degree, and average clustering coefficient at the end of each
+    calendar year.
 
     Parameters
     ----------
     rel_dicts : list of dict
-    sort_by   : 'start_date' or 'updated_at'
-    timing    : bool
+      Relationship dictionaries to draw edges from.
+    sort_by : str
+      Date field used to order edge additions: 'start_date' or
+      'updated_at'.
+    timing : bool
+      If True, print progress messages and timing at each stage.
     random_seed : int
+      Seed for tie-breaking among edges sharing the same date.
 
     Returns
     -------
-    yearly_stats : dict with keys 'year', 'mean_degree', 'max_degree',
-                   'avg_clustering', each a list indexed by year
-    D            : dict, terminal degree distribution {node: degree}
-    G            : nx.Graph, terminal graph
+    yearly_stats : dict
+      Keys 'year', 'mean_degree', 'max_degree', 'avg_clustering', each
+      a list indexed by (the index of) calendar year with at least
+      one edge added.
+    D : dict
+      Terminal degree distribution, {node: degree}.
+    G : networkx.Graph
+      Terminal graph.
     """
     rng = random.Random(random_seed)
 
@@ -250,7 +349,6 @@ def GraphStats_LittleSIS(rel_dicts, sort_by='start_date', timing=False,
     }
 
     # Group edges by year for efficient yearly processing
-    from itertools import groupby
     edges_by_year = {}
     for date_str, u, v in filtered:
         yr = int(date_str[:4])
@@ -298,8 +396,23 @@ def GraphStats_LittleSIS(rel_dicts, sort_by='start_date', timing=False,
 # =============================================================================
 def plot_graph_stats(yearly_stats, title='Graph Statistics — Annual Snapshots', save_path='graph_stats_yearly.pdf'):
     """
-    Plot mean degree, max degree, and average clustering coefficient
-    as annual time series.
+    Plots mean degree, max degree, and average clustering coefficient
+    (see GraphStats_LittleSIS) as annual time series, side by side.
+
+    Parameters
+    ----------
+    yearly_stats : dict
+      Output of GraphStats_LittleSIS, with keys 'year', 'mean_degree',
+      'max_degree', 'avg_clustering'.
+    title : str
+      Figure title.
+    save_path : str
+      Path the figure is saved to.
+
+    Returns
+    -------
+    None
+      Displays the figure and saves it to save_path.
     """
     years   = np.array(yearly_stats['year'])
     metrics = {
@@ -337,8 +450,26 @@ def plot_graph_stats(yearly_stats, title='Graph Statistics — Annual Snapshots'
 # =============================================================================
 def plot_degree_distribution(D, title='Terminal Degree Distribution', save_path='degree_distribution.pdf'):
     """
-    Plot the terminal degree distribution on a log-log scale.
-    Power-law exponent estimated via OLS (log-log) and MLE on log-binned data.
+    Plots the terminal degree distribution on log-log axes (raw and
+    log-binned), estimating and overlaying a power-law exponent via
+    both OLS regression on log-binned density and MLE (via the
+    powerlaw package) on the raw degree sequence.
+
+    Parameters
+    ----------
+    D : dict
+      Terminal degree distribution, {node: degree} (e.g. from
+      GraphStats_LittleSIS).
+    title : str
+      Figure title.
+    save_path : str
+      Path the figure is saved to.
+
+    Returns
+    -------
+    None
+      Displays the figure, saves it to save_path, and prints the
+      fitted OLS and MLE exponents.
     """
     from collections import Counter
     from scipy import stats
@@ -440,50 +571,14 @@ def plot_degree_distribution(D, title='Terminal Degree Distribution', save_path=
     print(f"MLE (raw sequence): gamma = {gamma_mle:.3f}, "
           f"xmin = {xmin_mle:.1f}")
 
-def graph_summary_from_yearly(yearly_stats_dict):
-    """
-    Extract terminal graph statistics from precomputed yearly stats
-    and graph objects.
-
-    Parameters
-    ----------
-    yearly_stats_dict : dict {name: (yearly_stats, G, D)}
-        yearly_stats is the dict output of GraphStats_LittleSIS,
-        G is the terminal graph, D is the terminal degree dict.
-
-    Prints a summary table and returns a dict of statistics.
-    """
-    stats = {}
-
-    print(f"{'Graph':<15} {'Nodes':>10} {'Edges':>10} "
-          f"{'Mean Degree':>14} {'Avg Clustering':>16}")
-    print("-" * 70)
-
-    for name, (yearly_stats, G, D) in yearly_stats_dict.items():
-        n_nodes   = G.number_of_nodes()
-        n_edges   = G.number_of_edges()
-        mean_deg  = yearly_stats['mean_degree'][-1]
-        avg_clust = yearly_stats['avg_clustering'][-1]
-
-        stats[name] = {
-            'n_nodes':        n_nodes,
-            'n_edges':        n_edges,
-            'mean_degree':    mean_deg,
-            'avg_clustering': avg_clust,
-        }
-
-        print(f"{name:<15} {n_nodes:>10,} {n_edges:>10,} "
-              f"{mean_deg:>14.4f} {avg_clust:>16.4f}")
-
-    return stats
-
 def PH_LittleSIS(rel_dicts, sort_by='start_date', timing=False,
                  maxDim=np.inf, random_seed=42):
     """
-    Build a graph from LittleSIS relationship dicts by adding edges in date
-    order (ties broken randomly with fixed seed). Iteratively tracks simplex
-    counts, average clustering coefficient, and cycle rank at each step, then
-    computes persistent homology from the resulting filtration.
+    Builds a graph from LittleSIS relationship dicts by adding edges in
+    date order (ties broken randomly with fixed seed), tracking the
+    clique complex's simplex counts and cycle rank CR_1 (= N_1 - N_0 +
+    beta_0) at each step, then computes persistent homology from the
+    resulting filtration.
 
     Parameters
     ----------
@@ -505,7 +600,8 @@ def PH_LittleSIS(rel_dicts, sort_by='start_date', timing=False,
     Betti        : np.ndarray, shape (4, n_steps)
     SimplexCounts: list of lists, one entry per edge-addition step
     Euler        : np.ndarray, shape (n_steps,)
-    cycleR       : list, length n_steps
+    cycleR       : list, length n_steps; CR_1 (= N_1 - N_0 + beta_0) at
+                   each step
     dates        : list of str, the sort_by date string for each step
     """
     rng = random.Random(random_seed)
@@ -669,12 +765,52 @@ def PH_LittleSIS(rel_dicts, sort_by='start_date', timing=False,
     return Betti, SimplexCounts, Euler, cycleR, dates
 
 def _sc(SimplexCounts, dim, n):
+    """
+    Extracts one dimension's simplex-count time series from a
+    SimplexCounts result, which per CLAUDE.md is a list of lists
+    (possibly ragged across timesteps), NOT a 2D numpy array.
+
+    Parameters
+    ----------
+    SimplexCounts : list of list of float
+      SimplexCounts[t] is the row of simplex counts by size at
+      timestep t.
+    dim : int
+      Column index (simplex size - 1) to extract.
+    n : int
+      Number of timesteps to extract (0..n-1).
+
+    Returns
+    -------
+    ndarray
+      1-D array of length n, with 0 where a row is too short to have
+      that column.
+    """
     return np.array([
         SimplexCounts[t][dim] if len(SimplexCounts[t]) > dim else 0
         for t in range(n)
     ], dtype=float)
 
 def _aggregate_yearly(arr, years, unique_years):
+    """
+    Reduces a per-step time series to one end-of-year snapshot per
+    year, taking each year's last observed value.
+
+    Parameters
+    ----------
+    arr : ndarray
+      Per-step values.
+    years : ndarray
+      Calendar year of each step in arr, aligned by index.
+    unique_years : ndarray
+      Years to report a snapshot for, in order.
+
+    Returns
+    -------
+    ndarray
+      One value per entry in unique_years: the last arr value in that
+      year, or NaN if the year has no steps.
+    """
     out = np.full(len(unique_years), np.nan)
     for i, yr in enumerate(unique_years):
         mask = years == yr
@@ -683,6 +819,30 @@ def _aggregate_yearly(arr, years, unique_years):
     return out
 
 def _style_ax(ax, xs, y, xlabel, x_is_dates=False):
+    """
+    Plots one line series with this module's standard marker/line
+    style and axis formatting (rotated x tick labels, compact y tick
+    formatting, and either yearly or date-based x ticks).
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+      Axis to draw on.
+    xs : array-like
+      X values.
+    y : array-like
+      Y values.
+    xlabel : str
+      X-axis label.
+    x_is_dates : bool
+      If True, format the x-axis for datetime values (4-year ticks);
+      otherwise use integer-valued ticks.
+
+    Returns
+    -------
+    None
+      Draws onto ax and sets its axis formatting.
+    """
     LINE_COLOR = '#2c6fad'
     LINE_KW    = dict(color=LINE_COLOR, lw=1.4, marker='o', markersize=3.5,
                   markerfacecolor='white', markeredgecolor=LINE_COLOR,
@@ -698,7 +858,45 @@ def _style_ax(ax, xs, y, xlabel, x_is_dates=False):
     ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f'{v:,.3g}'))
 
 def _yearly_xs_and_series(Betti, SimplexCounts, Euler, cycleR, dates):
-    """Aggregate all quantities to end-of-year snapshots."""
+    """
+    Computes normalized Betti numbers, cycle ranks, and filling
+    efficiencies from a persistent-homology run, and aggregates them
+    (along with simplex counts, Betti numbers, and Euler
+    characteristic) to end-of-year snapshots.
+
+    Derived quantities, per CLAUDE.md definitions: tb0/tb1/tb2 are the
+    normalized Betti numbers beta_tilde_k = beta_k / N_k; cr (input
+    cycleR) is CR_1 = N_1 - N_0 + beta_0; cr1b1 = CR_1 - beta_1 (the
+    number of independent 1-cycles filled by 2-simplices); cr2 is
+    CR_2 = N_2 - CR_1 + beta_1 (the same construction one dimension
+    up); cr2b2 = CR_2 - beta_2; g1 is gamma_1 = (CR_1 - beta_1) / N_2
+    (the fraction of ADDED 2-simplices that filled a 1-cycle, not the
+    fraction of 1-cycles filled); g2 is gamma_2 = (CR_2 - beta_2) / N_3,
+    the analogous fraction one dimension up.
+
+    Parameters
+    ----------
+    Betti : ndarray, shape (4, n_steps)
+      Betti[k][t] is the k-th Betti number at step t.
+    SimplexCounts : list of list of float
+      Simplex counts by size at each step (list of lists, per
+      CLAUDE.md convention).
+    Euler : ndarray, shape (n_steps,)
+      Euler characteristic at each step.
+    cycleR : array-like, length n_steps
+      CR_1 at each step.
+    dates : list of str
+      Date string (year in the first 4 characters) for each step.
+
+    Returns
+    -------
+    unique_years : ndarray
+      Calendar years spanned, one entry per year with a snapshot.
+    yearly : dict
+      Maps each of 's0','s1','s2','b0','b1','b2','tb0','tb1','tb2',
+      'cr1b1','g1','cr2b2','g2','chi' to its end-of-year-aggregated
+      ndarray (see _aggregate_yearly), aligned with unique_years.
+    """
     n    = len(SimplexCounts)
     b0   = Betti[0].astype(float)
     b1   = Betti[1].astype(float)
@@ -742,10 +940,35 @@ def _yearly_xs_and_series(Betti, SimplexCounts, Euler, cycleR, dates):
 def plot_ph_simplices_betti(Betti, SimplexCounts, Euler, cycleR, dates,
                             title='', save_path=None):
     """
-    3×3 figure:
-      Row 1: S0, S1, S2
-      Row 2: β0, β1, β2
-      Row 3: β̃0, β̃1, β̃2
+    Plots a 3x3 figure of simplex counts, Betti numbers, and
+    normalized Betti numbers over time (see _yearly_xs_and_series):
+      Row 1: N0, N1, N2
+      Row 2: beta_0, beta_1, beta_2
+      Row 3: beta_tilde_0, beta_tilde_1, beta_tilde_2
+
+    Parameters
+    ----------
+    Betti : ndarray, shape (4, n_steps)
+      Betti[k][t] is the k-th Betti number at step t.
+    SimplexCounts : list of list of float
+      Simplex counts by size at each step.
+    Euler : ndarray, shape (n_steps,)
+      Euler characteristic at each step (unused by this panel set,
+      passed through to _yearly_xs_and_series).
+    cycleR : array-like, length n_steps
+      CR_1 at each step.
+    dates : list of str
+      Date string (year in the first 4 characters) for each step.
+    title : str
+      Figure title.
+    save_path : str or None
+      If given, filename prefix (without extension) the figure is
+      saved to as PDF and PNG.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+      The created figure.
     """
     xs, Y = _yearly_xs_and_series(Betti, SimplexCounts, Euler, cycleR, dates)
     xlabel = 'Year'
@@ -780,10 +1003,36 @@ def plot_ph_simplices_betti(Betti, SimplexCounts, Euler, cycleR, dates,
 def plot_ph_cyclerank_euler(Betti, SimplexCounts, Euler, cycleR, dates,
                             title='', save_path=None):
     """
-    Layout:
-      Row 1 (2 cols): CR1−β1,  γ1
-      Row 2 (2 cols): CR2−β2,  γ2
+    Plots cycle rank, filling efficiency, and Euler characteristic
+    over time (see _yearly_xs_and_series). gamma_k is the fraction of
+    ADDED (k+1)-simplices that filled a k-cycle, not the fraction of
+    k-cycles filled. Layout:
+      Row 1 (2 cols): CR_1 - beta_1,  gamma_1 = (CR_1 - beta_1) / N_2
+      Row 2 (2 cols): CR_2 - beta_2,  gamma_2 = (CR_2 - beta_2) / N_3
       Row 3 (1 col, centred): Euler characteristic
+
+    Parameters
+    ----------
+    Betti : ndarray, shape (4, n_steps)
+      Betti[k][t] is the k-th Betti number at step t.
+    SimplexCounts : list of list of float
+      Simplex counts by size at each step.
+    Euler : ndarray, shape (n_steps,)
+      Euler characteristic at each step.
+    cycleR : array-like, length n_steps
+      CR_1 at each step.
+    dates : list of str
+      Date string (year in the first 4 characters) for each step.
+    title : str
+      Figure title.
+    save_path : str or None
+      If given, filename prefix (without extension) the figure is
+      saved to as PDF and PNG.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+      The created figure.
     """
     xs, Y = _yearly_xs_and_series(Betti, SimplexCounts, Euler, cycleR, dates)
     xlabel = 'Year'
@@ -827,10 +1076,34 @@ def plot_ph_cyclerank_euler(Betti, SimplexCounts, Euler, cycleR, dates,
 def plot_ph_graph(Betti, SimplexCounts, Euler, cycleR, dates,
                   title='', save_path=None):
     """
-    3×2 figure restricted to graph-level (dim 0 and 1) quantities:
+    Plots a 3x2 figure restricted to graph-level (dim 0 and 1)
+    quantities (see _yearly_xs_and_series):
       Row 1: N0, N1
-      Row 2: β0, β1
-      Row 3: β̃0, β̃1
+      Row 2: beta_0, beta_1
+      Row 3: beta_tilde_0, beta_tilde_1
+
+    Parameters
+    ----------
+    Betti : ndarray, shape (4, n_steps)
+      Betti[k][t] is the k-th Betti number at step t.
+    SimplexCounts : list of list of float
+      Simplex counts by size at each step.
+    Euler : ndarray, shape (n_steps,)
+      Euler characteristic at each step (unused by this panel set,
+      passed through to _yearly_xs_and_series).
+    cycleR : array-like, length n_steps
+      CR_1 at each step.
+    dates : list of str
+      Date string (year in the first 4 characters) for each step.
+    title : str
+      Figure title.
+    save_path : str or None
+      If given, filename the figure is saved to as PNG.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+      The created figure.
     """
     xs, Y  = _yearly_xs_and_series(Betti, SimplexCounts, Euler, cycleR, dates)
     xlabel = 'Year'
@@ -860,6 +1133,33 @@ def plot_ph_graph(Betti, SimplexCounts, Euler, cycleR, dates,
 
 def plot_ph_yearly(Betti, SimplexCounts, Euler, cycleR, dates,
                    title='', save_path='ph_yearly'):
+    """
+    Convenience wrapper that produces both standard yearly PH figures
+    by calling plot_ph_simplices_betti and plot_ph_cyclerank_euler in
+    sequence.
+
+    Parameters
+    ----------
+    Betti : ndarray, shape (4, n_steps)
+      Betti[k][t] is the k-th Betti number at step t.
+    SimplexCounts : list of list of float
+      Simplex counts by size at each step.
+    Euler : ndarray, shape (n_steps,)
+      Euler characteristic at each step.
+    cycleR : array-like, length n_steps
+      CR_1 at each step.
+    dates : list of str
+      Date string (year in the first 4 characters) for each step.
+    title : str
+      Title used for both figures.
+    save_path : str
+      Filename prefix; '_fig1'/'_fig2' are appended for the two figures.
+
+    Returns
+    -------
+    None
+      Displays and saves both figures.
+    """
     plot_ph_simplices_betti(Betti, SimplexCounts, Euler, cycleR, dates,
                             title=title,
                             save_path=save_path + '_fig1')
@@ -869,27 +1169,33 @@ def plot_ph_yearly(Betti, SimplexCounts, Euler, cycleR, dates,
 
 def ZZ_LittleSIS(rel_dicts, timing=False, maxDim=np.inf, random_seed=42):
     """
-    Build a zigzag filtration from LittleSIS relationship dicts. Edges are
-    added at start_date and removed at end_date (if present and is_current
-    is False). Duplicate edges (same undirected pair) are merged if their
-    intervals overlap, and kept as separate events if they do not.
-    Isolated nodes are removed when their last edge is deleted.
+    Builds a zigzag filtration from LittleSIS relationship dicts. Edges
+    are added at start_date and removed at end_date (if present and
+    is_current is False). Duplicate edges (same undirected pair) are
+    merged if their intervals overlap, and kept as separate events if
+    they do not. Isolated nodes are removed when their last edge is
+    deleted. Tracks clique-complex simplex counts and cycle rank CR_1
+    (= N_1 - N_0 + beta_0) at each event, then computes zigzag
+    persistent homology from the resulting filtration.
 
     Parameters
     ----------
     rel_dicts : list of dict
         Relationship dictionaries, e.g. [has_start_p2p, has_start_end_p2p].
     timing : bool
+        If True, print progress messages and timing at each stage.
     maxDim : int or np.inf
+        Maximum simplex dimension to track (e.g. maxDim=2 tracks up to triangles).
     random_seed : int
+        Seed for tie-breaking among events sharing the same date.
 
     Returns
     -------
     Betti        : np.ndarray, shape (4, n_steps)
     SimplexCounts: list of lists, one entry per event step
     Euler        : np.ndarray, shape (n_steps,)
-    cycleR       : list, length n_steps
-    dates        : list of str
+    cycleR       : list, length n_steps; CR_1 at each step
+    dates        : list of str, the event date string for each step
     """
     rng = random.Random(random_seed)
     SENTINEL = '9999-99-99'  # Represents open-ended intervals
@@ -1122,6 +1428,27 @@ def ZZ_LittleSIS(rel_dicts, timing=False, maxDim=np.inf, random_seed=42):
     return Betti, SimplexCounts, Euler, cycleR, dates
 
 def _yearly(arr, dates):
+    """
+    Reduces a per-step time series to one end-of-year snapshot per
+    year spanned by dates, taking each year's last observed value.
+    Unlike _aggregate_yearly, also derives the year range from dates.
+
+    Parameters
+    ----------
+    arr : ndarray
+      Per-step values.
+    dates : list of str
+      Date string (year in the first 4 characters) for each step,
+      aligned with arr by index.
+
+    Returns
+    -------
+    yr_range : ndarray
+      Calendar years spanned by dates, one entry per year.
+    out : ndarray
+      One value per entry in yr_range: the last arr value in that
+      year, or NaN if the year has no steps.
+    """
     years    = np.array([int(d[:4]) for d in dates])
     yr_range = np.arange(years.min(), years.max() + 1)
     out      = np.full(len(yr_range), np.nan)
@@ -1132,6 +1459,34 @@ def _yearly(arr, dates):
     return yr_range, out
 
 def _prepare(Betti, SC, Euler, cycleR, dates):
+    """
+    Computes graph-level normalized Betti numbers and aggregates
+    simplex counts, Betti numbers, normalized Betti numbers, and
+    Euler characteristic to end-of-year snapshots, for use in cohort
+    comparison plots.
+
+    Parameters
+    ----------
+    Betti : ndarray, shape (4, n_steps)
+      Betti[k][t] is the k-th Betti number at step t.
+    SC : list of list of float
+      Simplex counts by size at each step.
+    Euler : ndarray, shape (n_steps,)
+      Euler characteristic at each step.
+    cycleR : array-like, length n_steps
+      CR_1 at each step (unused by this function's output, accepted
+      for signature symmetry with other _yearly_xs_and_series callers).
+    dates : list of str
+      Date string (year in the first 4 characters) for each step.
+
+    Returns
+    -------
+    dict
+      Maps each of 's0','s1','b0','b1','tb0','tb1','chi' to a
+      (years, values) tuple from _yearly, where tb0/tb1 are the
+      normalized Betti numbers beta_tilde_0 = beta_0/N_0 and
+      beta_tilde_1 = beta_1/N_1.
+    """
     n   = len(SC)
     b0  = Betti[0].astype(float)
     b1  = Betti[1].astype(float)
@@ -1147,11 +1502,51 @@ def _prepare(Betti, SC, Euler, cycleR, dates):
     return {k: _yearly(v, dates) for k, v in raw.items()}
 
 def line_kw(color):
+    """
+    Builds this module's standard matplotlib line/marker style kwargs
+    for a given color.
+
+    Parameters
+    ----------
+    color : str
+      Line and marker edge color.
+
+    Returns
+    -------
+    dict
+      Keyword arguments suitable for Axes.plot (color, lw, marker,
+      markersize, markerfacecolor, markeredgecolor, markeredgewidth).
+    """
     return dict(color=color, lw=1.4, marker='o', markersize=3.5,
                 markerfacecolor='white', markeredgecolor=color,
                 markeredgewidth=1.0)
 
 def _style_ax2(ax, B, N, C, label, labels):
+    """
+    Plots three cohort series (bulk, non-bulk, combined) as
+    year-indexed lines on one axis, with this module's standard style.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+      Axis to draw on.
+    B : tuple
+      (years, values) for the "bulk" cohort series (see _yearly).
+    N : tuple
+      (years, values) for the "non-bulk" cohort series.
+    C : tuple
+      (years, values) for the "combined" cohort series.
+    label : str
+      Subplot title.
+    labels : sequence
+      labels[0:3] are the legend labels for B, N, C respectively;
+      labels[3:6] are their corresponding line colors.
+
+    Returns
+    -------
+    None
+      Draws onto ax and sets its title/axis formatting.
+    """
     yrs_b, vals_b = B
     yrs_n, vals_n = N
     yrs_c, vals_c = C
@@ -1170,12 +1565,39 @@ def plot_cohort_graph(labels, Betti_bulk, SC_bulk, Euler_bulk, cycleR_bulk, date
                       Betti_comb, SC_comb, Euler_comb, cycleR_comb, dates_comb,
                       title='', save_path=None):
     """
-    4-row layout:
+    Plots simplex counts, Betti numbers, normalized Betti numbers, and
+    Euler characteristic over time for three cohorts (e.g. bulk-import
+    vs. non-bulk vs. combined relationships) overlaid on shared axes
+    (see _prepare and _style_ax2). Layout:
       Row 1 (2 cols): N0,      N1
-      Row 2 (2 cols): β0,      β1
-      Row 3 (2 cols): β̃0,     β̃1
+      Row 2 (2 cols): beta_0,  beta_1
+      Row 3 (2 cols): beta_tilde_0, beta_tilde_1
       Row 4 (1 col, centred): Euler characteristic
     Single shared legend beneath the suptitle.
+
+    Parameters
+    ----------
+    labels : sequence
+      labels[0:3] are legend labels for the bulk/non-bulk/combined
+      cohorts; labels[3:6] are their corresponding line colors (see
+      _style_ax2).
+    Betti_bulk, SC_bulk, Euler_bulk, cycleR_bulk, dates_bulk :
+      Betti array, simplex counts, Euler characteristic, CR_1, and
+      dates (see PH_LittleSIS/ZZ_LittleSIS) for the "bulk" cohort.
+    Betti_non, SC_non, Euler_non, cycleR_non, dates_non :
+      Same, for the "non-bulk" cohort.
+    Betti_comb, SC_comb, Euler_comb, cycleR_comb, dates_comb :
+      Same, for the "combined" cohort.
+    title : str
+      Figure title.
+    save_path : str or None
+      If given, filename prefix (without extension) the figure is
+      saved to as PDF and PNG.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+      The created figure.
     """
     B = _prepare(Betti_bulk, SC_bulk, Euler_bulk, cycleR_bulk, dates_bulk)
     N = _prepare(Betti_non,  SC_non,  Euler_non,  cycleR_non,  dates_non)

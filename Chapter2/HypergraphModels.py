@@ -12,20 +12,17 @@ Date: 2026
 # ============================================================================
 import dionysus as d # C++ package with python bindings for persistent homology
 
-import networkx as nx # Network structures
 import numpy as np # Numpy arrays and operations
 import random # Random sampling for network models
-from itertools import combinations, product # For getting different simplices and all combinations of lists
+from itertools import combinations # For getting different simplices and all combinations of lists
 
-import matplotlib.gridspec as gridspec
 from matplotlib.lines import Line2D
 from scipy.special import gammaln
 from scipy import stats
 import matplotlib.cm as cm
-import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt # Plotting
 import time # Timing simulations
-from tqdm.notebook import trange, tqdm # Allows for real-time progress bar of simulations
+from tqdm.notebook import tqdm # Allows for real-time progress bar of simulations
 
 from rbloom import Bloom
 import sys
@@ -34,14 +31,12 @@ import os
 import pickle # Takes environment variables and saves them as is
 import gzip # Allows for compression of saved files
 from concurrent.futures import ProcessPoolExecutor # Parallelization functions
-from joblib import Parallel, delayed # Parallelization functions
 import multiprocessing # Get number of cpu cores
 import collections # Collecting degree dist using counter
 
 import xgi
 import math
 from collections import defaultdict
-from array import array
 import bisect
 
 # ============================================================================
@@ -52,22 +47,31 @@ import bisect
 
 def Get_Simpliciality_SF(filename, processed_filename = None, minDim = 2, maxDim = np.inf):
   """
-  Input: filename = string file name to load hypergraph
-         processed_filename = string file name to save data to
-         minDim = minimum simplex size to consider. Simplices below this
-                  dimension are disregarded. Simplices equal to this dimension
-                  are automatically downward closed and now counted.
-         maxDim = maximum simplex dimension to consider. Used to
-                  reduce computational complexity for large hypergraphs
-                  with high cardinality edges.
-  Return: SimplicialFraction = ratio of downward-closed hyperedges to
-                               the total number of hyperedges
-          Lengths = dictionary keeping track of the number of simplices of
-                    each dimension which are downward closed.
-  Description: To compute the simplicial fraction we take a dynamic
-  programming approach. We first sort the edges by ascending length.
-  Then, to check if a simplex e is downward closed it is sufficient to
-  check if its |e|-1 sized subsets belong to H and are downward closed.
+  Computes the simplicial fraction sigma_SF (proportion of hyperedges,
+  above minDim, that are downwardly closed) of a hypergraph, using a
+  dynamic-programming pass over edges sorted by ascending size.
+
+  Parameters
+  ----------
+  filename : str or dict
+    Path to a gzip-pickled hypergraph dict {edge_id: nodes}, or the
+    hypergraph dict itself.
+  processed_filename : str or None
+    If given, path to save the computed output to (gzip-pickled).
+  minDim : int
+    Minimum edge size to consider. Edges below this size are
+    disregarded; edges equal to this size are automatically downward
+    closed and are not counted toward sigma_SF.
+  maxDim : int or float
+    Maximum edge size to consider, to bound computational cost for
+    hypergraphs with high-cardinality edges.
+
+  Returns
+  -------
+  Data : list
+    Data[0] : float, sigma_SF, the simplicial fraction.
+    Data[1] : collections.Counter, the number of downward-closed edges
+              of each size (restricted to minDim < size <= maxDim).
   """
   if type(filename) == dict:
     H = filename
@@ -143,21 +147,37 @@ def Get_Simpliciality_SF(filename, processed_filename = None, minDim = 2, maxDim
 
 def Get_Simpliciality_LSF(filename, processed_filename, minDim = 2, maxDim = np.inf):
   """
-  Input: filename = string file name to load hypergraph
-         processed_filename = string file name to save data to
-         minDim = minimum simplex size to consider. Simplices below this
-                  dimension are disregarded. Simplices equal to this dimension
-                  are automatically downward closed and now counted.
-         maxDim = maximum simplex dimension to consider. Used to
-                  reduce computational complexity for large hypergraphs
-                  with high cardinality edges.
-  Return: LSF = list of tuple pairs (LSF(v), deg(v)) for all vertices v in H
-          Assortativity = assortativity of LSF
-  Description: First, we determine whether each edge in H is downward closed
+  Computes the local simplicial fraction (LSF) at every node: the
+  simplicial fraction sigma_SF restricted to each node's neighborhood
+  edge set, plus the assortativity of LSF across adjacent nodes.
+
+  First, we determine whether each edge in H is downward closed
   using the same method as Get_Simpliciality_SF. Then for each node v we form
   the neighborhood N(v). At that point we simply check whether or not each
   each edge in N(v) is downward closed in H, since if a subset of e belongs
   to N(v) then any subsets of e in H must also belong to N(v).
+
+  Parameters
+  ----------
+  filename : str
+    Path to a gzip-pickled (hypergraph, ...) tuple to load.
+  processed_filename : str
+    Path to save the computed output to (gzip-pickled).
+  minDim : int
+    Minimum edge size to consider; edges at or below this size are
+    excluded from LSF (though they still contribute to neighborhoods).
+  maxDim : int or float
+    Maximum edge size to consider, to bound computational cost.
+
+  Returns
+  -------
+  LSF : list of tuple
+    One (LSF(v), deg(v)) pair per node v in H, where LSF(v) is the
+    local simplicial fraction of v's neighborhood (None if v has no
+    valid neighborhood) and deg(v) is v's hyperdegree.
+  Assortativity : float
+    Pearson-style assortativity of LSF across adjacent node pairs
+    (NaN if the mean LSF across nodes is 0).
   """
   # Load data from input filename
   with gzip.open(filename, 'rb') as f:
@@ -286,6 +306,28 @@ def Get_Simpliciality_LSF(filename, processed_filename, minDim = 2, maxDim = np.
   return LSF, Assortativity
 
 def process_batch_of_nodes(batch_data):
+    """
+    Worker function for PC_Get_Simpliciality_LSF: computes local
+    simplicial fraction (LSF) and neighborhood data for one batch of
+    nodes, for use with ProcessPoolExecutor.map.
+
+    Parameters
+    ----------
+    batch_data : tuple
+      (vertices, H_v_batch, IsSimplex, minDim, maxDim), where vertices
+      is the list of nodes in this batch, H_v_batch maps each node to
+      its adjacent-edge list, IsSimplex marks which edges are downward
+      closed, and minDim/maxDim bound edge sizes considered.
+
+    Returns
+    -------
+    results : dict
+      Maps each node v in the batch to a 4-element list
+      [node_edges, N_v, LSF(v), deg(v)], where node_edges is v's
+      adjacent-edge list, N_v is v's neighborhood node set (None if v
+      is disregarded), LSF(v) is v's local simplicial fraction (None
+      if disregarded), and deg(v) is v's hyperdegree.
+    """
     vertices, H_v_batch, IsSimplex, minDim, maxDim = batch_data
     results = {}
 
@@ -331,8 +373,20 @@ def process_batch_of_nodes(batch_data):
 
 def create_batches(items, batch_count):
     """
-    Distribute items to workers in a strided pattern
-    where worker j gets vertices i*num_workers + j
+    Distributes items to workers in a strided pattern where worker j
+    gets items i*num_workers + j.
+
+    Parameters
+    ----------
+    items : iterable
+      Items to distribute (e.g. vertex ids).
+    batch_count : int
+      Number of worker batches to create.
+
+    Returns
+    -------
+    batches : list of list
+      batches[j] holds the items assigned to worker j.
     """
     all_vertices = list(items)
     batches = [[] for _ in range(batch_count)]
@@ -346,14 +400,30 @@ def create_batches(items, batch_count):
 
 def PC_Get_Simpliciality_LSF(filename, processed_filename, numWorkers = multiprocessing.cpu_count(), minDim = 2, maxDim = np.inf):
   """
-  Input: filename = string file name to load hypergraph
-         processed_filename = string file name to save data to
-         minDim = minimum simplex size to consider. Simplices below this
-                  dimension are disregarded. Simplices equal to this dimension
-                  are automatically downward closed and now counted.
-         maxDim = maximum simplex dimension to consider. Used to
-                  reduce computational complexity for large hypergraphs
-                  with high cardinality edges.
+  Parallel (ProcessPoolExecutor-based) version of Get_Simpliciality_LSF:
+  computes the local simplicial fraction (LSF) and its assortativity
+  across nodes, distributing per-node work across numWorkers batches.
+
+  Parameters
+  ----------
+  filename : str
+    Path to a gzip-pickled (hypergraph, ...) tuple to load.
+  processed_filename : str
+    Path to save the computed output to (gzip-pickled).
+  numWorkers : int
+    Number of parallel worker processes to use.
+  minDim : int
+    Minimum edge size to consider; edges at or below this size are
+    excluded from LSF (though they still contribute to neighborhoods).
+  maxDim : int or float
+    Maximum edge size to consider, to bound computational cost.
+
+  Returns
+  -------
+  int
+    0 on success. The [LSF, Assortativity] result (see
+    Get_Simpliciality_LSF) is written to processed_filename rather
+    than returned directly.
   """
 
   # Load data from input filename
@@ -476,8 +546,20 @@ def PC_Get_Simpliciality_LSF(filename, processed_filename, numWorkers = multipro
 
 def SimplexCounts(Complex):
     """
-    Input a simplical complex and return the counts of simplices of each dimension,
-    as well as the dimension of the complex (largest dimension of simplices).
+    Counts the number of simplices of each size in a simplicial complex.
+
+    Parameters
+    ----------
+    Complex : iterable of tuple
+      A simplicial complex, as an iterable of simplices (each a tuple
+      of node ids).
+
+    Returns
+    -------
+    Counts : list of int
+      Counts[i] is the number of simplices of size i+1 (e.g. Counts[0]
+      is the number of vertices, Counts[1] the number of edges).
+      Empty list if Complex is empty.
     """
     if not Complex:
         return []
@@ -492,9 +574,24 @@ def SimplexCounts(Complex):
 
 def DownwardClosureComplex(H, k = float('inf')):
     """
-    Input a networkx graph G and output the clique simplicial
-    complex corresponding to G, where every node, edge and
-    clique (up to and including size k) is encoded as simplices.
+    Builds the simplicial complex corresponding to a hypergraph H by
+    downward closure: every hyperedge (up to size k), along with all
+    of its sub-hyperedges, is encoded as a simplex.
+
+    Parameters
+    ----------
+    H : dict
+      Hypergraph as {edge_id: nodes}, where nodes is an iterable of
+      node ids for that hyperedge.
+    k : int or float
+      Maximum simplex size (number of nodes) to include; larger
+      hyperedges are truncated to their size-k subsets.
+
+    Returns
+    -------
+    Complex : set of tuple
+      The downward-closed simplicial complex, as a set of simplices
+      (each a sorted tuple of node ids).
     """
     Complex = set()
 
@@ -517,9 +614,28 @@ def DownwardClosureComplex(H, k = float('inf')):
 
 def ComputeResults(filename, processed_filename, p = 2):
   """
-  Input a networkx graph G, and prime p to compute the betti
-  numbers of the clique complex of G over Z mod p. Return the
-  exact euler characteristic, as well as Betti numbers b0, b1, b2.
+  Computes the Euler characteristic and Betti numbers (b0, b1, b2) of
+  the downward-closure complex (truncated to simplices of size <= 4)
+  of a hypergraph, over Z mod p.
+
+  Parameters
+  ----------
+  filename : str or dict
+    Path to a gzip-pickled (hypergraph, ...) tuple to load, or the
+    hypergraph dict itself.
+  processed_filename : str
+    Path to save the computed output to (gzip-pickled).
+  p : int
+    Prime modulus for the homology coefficient field Z mod p.
+
+  Returns
+  -------
+  data : list
+    data[0] : float, b0 (0th Betti number) of the complex.
+    data[1] : float, b1 (1st Betti number) of the complex.
+    data[2] : float, b2 (2nd Betti number) of the complex.
+    data[3] : float, the Euler characteristic.
+    data[4] : list of int, simplex counts by size (see SimplexCounts).
   """
   if type(filename) == dict:
       H = filename
@@ -565,6 +681,34 @@ def ComputeResults(filename, processed_filename, p = 2):
   return data
 
 def Get_SimplexCounts_EulerChar(filename, processed_filename, maxMemory, maxDim = np.inf):
+  """
+  Computes, for a temporally-growing hypergraph, the simplex counts
+  by size and the Euler characteristic at each timestep (edge
+  addition), tracking already-added simplices with a memory-bounded
+  Bloom filter instead of an exact set.
+
+  Parameters
+  ----------
+  filename : str
+    Path to a gzip-pickled (hypergraph, ...) tuple to load, where the
+    hypergraph dict maps timestep -> hyperedge nodes.
+  processed_filename : str
+    Path to save the computed output to (gzip-pickled).
+  maxMemory : float
+    Maximum memory, in GB, to allocate to the Bloom filter used to
+    track previously-seen simplices.
+  maxDim : int or float
+    Maximum hyperedge size to consider, to bound computational cost.
+
+  Returns
+  -------
+  int
+    0 on success. The [SimplexCounts, Euler] result is written to
+    processed_filename rather than returned directly, where
+    SimplexCounts is a (timesteps x 4) array of simplex counts by
+    size (dims 1-4) at each timestep, and Euler is a 1-D array of the
+    Euler characteristic at each timestep.
+  """
   # Load data from input filename
   with gzip.open(filename, 'rb') as f:
     try:
@@ -656,7 +800,30 @@ def Get_SimplexCounts_EulerChar(filename, processed_filename, maxMemory, maxDim 
 
 def check_if_simplex(Subsets, Supersets, IsSimplex, SimplexCount, e):
   """
-  Recursive function
+  Recursively determines whether edge e is downward closed (a
+  simplex) and, if so, propagates the check to its immediate
+  supersets, updating SimplexCount as edges flip from non-simplex to
+  simplex.
+
+  Parameters
+  ----------
+  Subsets : dict
+    Maps each edge to the set of its size-(|e|-1) sub-edges seen so far.
+  Supersets : dict
+    Maps each edge to the set of its immediate super-edges seen so far.
+  IsSimplex : dict
+    Maps each edge to whether it is currently downward closed;
+    updated in place.
+  SimplexCount : int
+    Running count of downward-closed edges (above minDim).
+  e : tuple
+    The edge to check.
+
+  Returns
+  -------
+  int
+    The updated SimplexCount after checking e and any supersets whose
+    status changed as a result.
   """
   # By default increase simplex count by 1.
   IsSimplex[e] = True
@@ -682,8 +849,30 @@ def check_if_simplex(Subsets, Supersets, IsSimplex, SimplexCount, e):
 
 def recheck_if_simplex(Subsets, Supersets, IsSimplex, SimplexCount, e):
     """
-    Recheck if e is still a simplex after a subset was removed.
-    Similar to check_if_simplex but for updates.
+    Recursively marks edge e (and any supersets that were only
+    downward closed because of e) as no longer a simplex, after one
+    of e's subsets was removed. Mirrors check_if_simplex but in the
+    simplex-to-non-simplex direction.
+
+    Parameters
+    ----------
+    Subsets : dict
+      Maps each edge to the set of its size-(|e|-1) sub-edges seen so far.
+    Supersets : dict
+      Maps each edge to the set of its immediate super-edges seen so far.
+    IsSimplex : dict
+      Maps each edge to whether it is currently downward closed;
+      updated in place.
+    SimplexCount : int
+      Running count of downward-closed edges (above minDim).
+    e : tuple
+      The edge that is no longer downward closed.
+
+    Returns
+    -------
+    int
+      The updated SimplexCount after demoting e and any supersets
+      whose status changed as a result.
     """
     IsSimplex[e] = False
     SimplexCount -= 1
@@ -697,7 +886,47 @@ def recheck_if_simplex(Subsets, Supersets, IsSimplex, SimplexCount, e):
 
 def Get_Simpliciality_SF_TS_step(H_frozen, t, SimplexCount, CandidateCount, subsets, supersets, Subsets, Supersets, IsSimplex, E, minDim = 2, maxDim = np.inf):
     """
+    Incrementally updates the simplicial fraction sigma_SF's running
+    counts for the addition of edge H_frozen[t]: registers its
+    subset/superset relationships and updates IsSimplex for it and
+    any supersets it completes, without rescanning the whole
+    hypergraph.
 
+    Parameters
+    ----------
+    H_frozen : dict
+      Maps timestep -> frozenset of nodes, the edge added/removed at
+      each timestep.
+    t : hashable
+      Timestep of the edge being added.
+    SimplexCount : int
+      Running count of downward-closed edges (above minDim).
+    CandidateCount : int
+      Running count of edges eligible to be simplices (above minDim).
+    subsets : iterable
+      Timesteps of edges that are subsets of H_frozen[t].
+    supersets : iterable
+      Timesteps of edges that are supersets of H_frozen[t].
+    Subsets : dict
+      Maps each edge to the set of its size-(|e|-1) sub-edges seen so far.
+    Supersets : dict
+      Maps each edge to the set of its immediate super-edges seen so far.
+    IsSimplex : dict
+      Maps each edge to whether it is currently downward closed;
+      updated in place.
+    E : set
+      Set of edges currently present in the hypergraph; updated in place.
+    minDim : int
+      Minimum edge size to consider toward sigma_SF.
+    maxDim : int or float
+      Maximum edge size to consider toward sigma_SF.
+
+    Returns
+    -------
+    SimplexCount : int
+      Updated count of downward-closed edges.
+    CandidateCount : int
+      Updated count of edges eligible to be simplices.
     """
 
     e = H_frozen[t]
@@ -736,7 +965,47 @@ def Get_Simpliciality_SF_TS_step(H_frozen, t, SimplexCount, CandidateCount, subs
 
 def Remove_Simpliciality_SF_TS_step(H_frozen, t, SimplexCount, CandidateCount, subsets, supersets, Subsets, Supersets, IsSimplex, E, minDim = 2, maxDim = np.inf):
     """
-    Remove an edge and update SF-related data structures.
+    Incrementally updates the simplicial fraction sigma_SF's running
+    counts for the removal of edge H_frozen[t]: unregisters its
+    subset/superset relationships and demotes any supersets that are
+    no longer downward closed as a result, without rescanning the
+    whole hypergraph.
+
+    Parameters
+    ----------
+    H_frozen : dict
+      Maps timestep -> frozenset of nodes, the edge added/removed at
+      each timestep.
+    t : hashable
+      Timestep of the edge being removed.
+    SimplexCount : int
+      Running count of downward-closed edges (above minDim).
+    CandidateCount : int
+      Running count of edges eligible to be simplices (above minDim).
+    subsets : iterable
+      Timesteps of edges that are subsets of H_frozen[t].
+    supersets : iterable
+      Timesteps of edges that are supersets of H_frozen[t].
+    Subsets : dict
+      Maps each edge to the set of its size-(|e|-1) sub-edges seen so far.
+    Supersets : dict
+      Maps each edge to the set of its immediate super-edges seen so far.
+    IsSimplex : dict
+      Maps each edge to whether it is currently downward closed;
+      updated in place.
+    E : set
+      Set of edges currently present in the hypergraph; updated in place.
+    minDim : int
+      Minimum edge size to consider toward sigma_SF.
+    maxDim : int or float
+      Maximum edge size to consider toward sigma_SF.
+
+    Returns
+    -------
+    SimplexCount : int
+      Updated count of downward-closed edges.
+    CandidateCount : int
+      Updated count of edges eligible to be simplices.
     """
     e = H_frozen[t]
 
@@ -775,7 +1044,42 @@ def Remove_Simpliciality_SF_TS_step(H_frozen, t, SimplexCount, CandidateCount, s
 
 def Get_Simpliciality_FES_TS_step(H_frozen, t, subsets, supersets, AllSubsets, AllSupersets, IsMaximal, minDim = 2, maxDim = np.inf):
     """
+    Incrementally updates and returns the face edit simpliciality
+    sigma_FES for the addition of edge H_frozen[t]: updates the
+    maximal-face set and each maximal face's known sub-edges, then
+    recomputes sigma_FES as the mean, over maximal faces, of the
+    fraction of a face's 2^|face|-1 possible non-empty sub-edges
+    (excluding those at or below minDim) that are actually present.
 
+    Parameters
+    ----------
+    H_frozen : dict
+      Maps timestep -> frozenset of nodes, the edge added/removed at
+      each timestep.
+    t : hashable
+      Timestep of the edge being added.
+    subsets : iterable
+      Timesteps of edges that are subsets of H_frozen[t].
+    supersets : iterable
+      Timesteps of edges that are supersets of H_frozen[t].
+    AllSubsets : dict
+      Maps each edge to the set of all (not just immediate) sub-edges
+      seen so far; updated in place.
+    AllSupersets : dict
+      Maps each edge to the set of all (not just immediate) super-edges
+      seen so far; updated in place.
+    IsMaximal : set
+      Set of edges with no known supersets; updated in place.
+    minDim : int
+      Minimum edge size; sub-edges at or below this size are excluded
+      from the sigma_FES denominator/numerator.
+    maxDim : int or float
+      Maximum edge size to consider.
+
+    Returns
+    -------
+    float
+      The updated sigma_FES value (0 if there are no maximal faces).
     """
 
     e = H_frozen[t]
@@ -818,7 +1122,42 @@ def Get_Simpliciality_FES_TS_step(H_frozen, t, subsets, supersets, AllSubsets, A
 
 def Remove_Simpliciality_FES_TS_step(H_frozen, t, subsets, supersets, AllSubsets, AllSupersets, IsMaximal, minDim = 2, maxDim = np.inf):
     """
-    Remove an edge and update FES-related data structures.
+    Incrementally updates the face edit simpliciality sigma_FES's
+    data structures for the removal of edge H_frozen[t]: removes it
+    from its neighbors' known sub/super-edge sets, updates IsMaximal
+    if it was maximal (promoting any of its sub-edges left without
+    supersets), and clears its own tracked sets. Does not itself
+    return a recomputed sigma_FES value (use
+    Get_Simpliciality_FES_TS_step's return for that).
+
+    Parameters
+    ----------
+    H_frozen : dict
+      Maps timestep -> frozenset of nodes, the edge added/removed at
+      each timestep.
+    t : hashable
+      Timestep of the edge being removed.
+    subsets : iterable
+      Timesteps of edges that are subsets of H_frozen[t].
+    supersets : iterable
+      Timesteps of edges that are supersets of H_frozen[t].
+    AllSubsets : dict
+      Maps each edge to the set of all (not just immediate) sub-edges
+      seen so far; updated in place.
+    AllSupersets : dict
+      Maps each edge to the set of all (not just immediate) super-edges
+      seen so far; updated in place.
+    IsMaximal : set
+      Set of edges with no known supersets; updated in place.
+    minDim : int
+      Minimum edge size; unused directly but kept for signature
+      symmetry with Get_Simpliciality_FES_TS_step.
+    maxDim : int or float
+      Maximum edge size to consider.
+
+    Returns
+    -------
+    None
     """
     e = H_frozen[t]
 
@@ -851,14 +1190,32 @@ def Remove_Simpliciality_FES_TS_step(H_frozen, t, subsets, supersets, AllSubsets
 
 def simpliciality_process_hypergraph(H):
     """
-    Process a hypergraph dictionary incrementally, handling both additions and removals.
+    Processes a hypergraph incrementally over time, tracking sigma_SF
+    and sigma_FES at each addition, plus per-step counts of "upper"
+    and "lower" subset/superset pairs formed. An "upper pair" is
+    formed when a newly-added edge's smaller counterpart (subset or
+    superset) was already present, i.e. the smaller edge arrived
+    first; a "lower pair" is formed when the larger counterpart
+    arrived first.
 
-    Args:
-        H: dict mapping timestep -> set of nodes
-           Removals are indicated by negative timesteps in the dict
+    Parameters
+    ----------
+    H : dict
+      Maps timestep t -> hyperedge nodes. A removal of the edge added
+      at timestep t is indicated by the presence of key -t in H.
 
-    Returns:
-        List of results for each timestep
+    Returns
+    -------
+    upper_pairs : ndarray
+      Per-addition-timestep count of upper pairs formed (net of any
+      removed at that same timestep).
+    lower_pairs : ndarray
+      Per-addition-timestep count of lower pairs formed (net of any
+      removed at that same timestep).
+    SF_ts : ndarray
+      sigma_SF (simplicial fraction) after each addition timestep.
+    FES_ts : ndarray
+      sigma_FES (face edit simpliciality) after each addition timestep.
     """
     processor = HypergraphProcessor()
 
@@ -935,6 +1292,30 @@ def simpliciality_process_hypergraph(H):
     return (np.array(upper_pairs), np.array(lower_pairs), np.array(SF_ts), np.array(FES_ts))
 
 def PH_add_e(Simplices, SimplexCounts, Times, e, timer):
+    """
+    Adds edge e (and, by downward closure, any of its not-yet-seen
+    sub-edges) to the running simplex set, incrementing SimplexCounts
+    and recording birth times in Times for simplices up to size 4 (so
+    that b0, b1, b2 are computed correctly).
+
+    Parameters
+    ----------
+    Simplices : set
+      Set of simplices added so far; updated in place.
+    SimplexCounts : ndarray
+      2D array indexed [timer][simplex_size - 1]; SimplexCounts[timer]
+      is updated in place to reflect the addition of e.
+    Times : list of tuple
+      List of (simplex_as_list, birth_timer) pairs; updated in place.
+    e : tuple
+      The edge being added.
+    timer : int
+      Current timestep index.
+
+    Returns
+    -------
+    None
+    """
     # Add e to simplices, update simplex counts, and add to times
     Simplices.add(e)
     SimplexCounts[timer][len(e)-1] += 1
@@ -955,6 +1336,35 @@ def PH_add_e(Simplices, SimplexCounts, Times, e, timer):
                     Times.append((list(subset), timer))
 
 def PH(SimplexCounts, start, Times, timer, timing):
+    """
+    Computes persistent homology of a growing simplicial filtration
+    and returns Betti numbers b0-b3 and the Euler characteristic at
+    every timestep.
+
+    Parameters
+    ----------
+    SimplexCounts : ndarray
+      2D array, SimplexCounts[i][j] the count of size-(j+1) simplices
+      present at timestep i, used to compute the Euler characteristic.
+    start : float
+      Timestamp (from time.time()) marking the start of this phase,
+      used only for timing printouts.
+    Times : list of tuple
+      List of (simplex_as_list, birth_timer) pairs defining the
+      filtration.
+    timer : int
+      Final timestep index (number of timesteps - 1).
+    timing : bool
+      Whether to print progress/timing information.
+
+    Returns
+    -------
+    Betti : ndarray, shape (4, timer+1)
+      Betti[k][t] is the k-th Betti number (k = 0..3) at timestep t.
+    Euler : ndarray, shape (timer+1,)
+      Euler[t] is the Euler characteristic at timestep t, computed as
+      the alternating sum of SimplexCounts[t].
+    """
     # Create filtration of simplicial complexes using Times
     f = d.Filtration(Times)
 
@@ -999,6 +1409,32 @@ def PH(SimplexCounts, start, Times, timer, timing):
     return Betti, Euler
 
 def Extract_XtYt(H, timing = False):
+  """
+  Reconstructs the PA-model growth statistics X_t and Y_t (per
+  CLAUDE.md: Y_t is hyperedge size, X_t is the number of new nodes
+  added at step t, with p = E[X_t]/E[Y_t]) from a real, timestamped
+  hypergraph, by repeatedly removing the largest edge among those
+  with the latest timestamp and counting how many of its nodes become
+  isolated (degree 0) as a result. Also plots isolated-node counts
+  per iteration and their cumulative sum.
+
+  Parameters
+  ----------
+  H : xgi.Hypergraph
+    Timestamped hypergraph; edges must carry a 'timestamp' attribute.
+  timing : bool
+    Whether to print progress information during removal.
+
+  Returns
+  -------
+  removed_edges_info : list of dict
+    One entry per removed edge (in removal order), each with keys:
+    'iteration' (int, removal step index), 'edge_id', 'timestamp',
+    'edge_size' (this step's Y_t), 'isolated_nodes' (this step's
+    X_t, the count of nodes left with degree 0), 'nodes_in_edge'
+    (all nodes in the removed edge), and 'isolated_node_ids' (the
+    nodes among them that became isolated).
+  """
   H_working = H.copy()
 
   # Initialize tracking variables
@@ -1149,6 +1585,24 @@ def Extract_XtYt(H, timing = False):
   return removed_edges_info
 
 def process_dataset(name, timing=False):
+    """
+    Loads a named XGI dataset, cleans it (removing multiedges,
+    singletons, and isolates), extracts its PA-model X_t/Y_t growth
+    statistics via Extract_XtYt, and pickles the result. Skips
+    datasets already processed.
+
+    Parameters
+    ----------
+    name : str
+      Name of the XGI dataset to load (passed to xgi.load_xgi_data).
+    timing : bool
+      Whether to print progress information during extraction.
+
+    Returns
+    -------
+    None
+      Writes the Extract_XtYt output to 'XtYt_FromData/<name>.pkl'.
+    """
     filename = 'XtYt_FromData/' + str(name) + '.pkl'
     # Check if current file already exists, if it does exist we do not
     # want to waste time running it again
@@ -1171,15 +1625,33 @@ def process_dataset(name, timing=False):
 
 def HG_ErdosRenyi_kUnif(n, K, p = 1, timing = False):
     """
-    Creates an evolving k-uniform Erdos-Renyi model on hypergraphs by starting
-    with a hypergraph with n nodes and no edges. Then, each edge
-    of size K is selected uniformly at random and added.
-    Input: int n, the number of nodes in H
-           int K, the edge sizes
-           float p, the proportion of edges to add
-           bool timing, whether to display timing information
-    Output: Betti, an array of the 0, 1 and 2 Betti numbers for each time step
-            SimplexCounts
+    Simulates an evolving K-uniform Erdos-Renyi hypergraph model:
+    starting from n isolated nodes, every possible size-K edge is
+    added in a uniformly random order (optionally stopping early
+    after a proportion p of edges), computing persistent homology of
+    the downward-closure complex as it grows.
+
+    Parameters
+    ----------
+    n : int
+      Number of nodes.
+    K : int
+      Size of every hyperedge.
+    p : float
+      Proportion of the total possible edges to add before stopping.
+    timing : bool
+      Whether to display progress bars and timing information.
+
+    Returns
+    -------
+    H : dict
+      The added hyperedges, as {edge_index: edge (tuple of nodes)}.
+    Betti : ndarray, shape (4, timer+1)
+      Betti[k][t] is the k-th Betti number at timestep t.
+    SimplexCounts : ndarray
+      Simplex counts by size at each timestep (see PH_add_e).
+    Euler : ndarray, shape (timer+1,)
+      Euler characteristic at each timestep.
     """
     if timing:
         print("(1/5) Initializing hypergraph, variables and data structures",flush=True)
@@ -1242,15 +1714,36 @@ def HG_ErdosRenyi_kUnif(n, K, p = 1, timing = False):
 
 def HG_ErdosRenyi(n, K, p = 1, timing = False):
     """
-    Creates an evolving Erdos-Renyi model on hypergraphs by starting
-    with a hypergraph with n nodes and no edges. Then, each edge
-    of size <= K is selected uniformly at random and added.
-    Input: int n, the number of nodes in H
-           int K, the maximum allowable edge size
-           float p, the proportion of edges to add
-           bool timing, whether to display timing information
-    Output: Betti, an array of the 0, 1 and 2 Betti numbers for each time step
-            SimplexCounts
+    Simulates an evolving (nonuniform) Erdos-Renyi hypergraph model:
+    starting from n isolated nodes, every possible edge of size 2 up
+    to K is added in a uniformly random order (optionally stopping
+    early after a proportion p of edges), computing persistent
+    homology of the downward-closure complex as it grows.
+
+    Parameters
+    ----------
+    n : int
+      Number of nodes.
+    K : int
+      Maximum hyperedge size.
+    p : float
+      Proportion of the total possible edges to add before stopping.
+    timing : bool
+      Whether to display progress bars and timing information.
+
+    Returns
+    -------
+    H : dict
+      The added hyperedges, as {edge_index: edge (tuple of nodes)}.
+    Betti : ndarray, shape (4, timer+1)
+      Betti[k][t] is the k-th Betti number at timestep t.
+    SimplexCounts : ndarray
+      Simplex counts by size at each timestep (see PH_add_e).
+    EdgeCounts : ndarray
+      Counts of added hyperedges (not their downward closure) by
+      size, at each timestep.
+    Euler : ndarray, shape (timer+1,)
+      Euler characteristic at each timestep.
     """
     if timing:
         print("(1/5) Initializing hypergraph, variables and data structures",flush=True)
@@ -1318,8 +1811,35 @@ def HG_ErdosRenyi(n, K, p = 1, timing = False):
 
 def HG_PreferentialAttachment_kUnif(K, steps, timing=False):
     """
-    Input:
-    Output: Hypergraph dictionary H along with the degree frequency distribution D.
+    Simulates a linear preferential-attachment hypergraph model:
+    starting from one size-(K-1) edge, at each step a new node forms
+    a size-K hyperedge with K-1 existing nodes chosen with
+    probability proportional to their current degree, then computes
+    persistent homology of the downward-closure complex as it grows.
+
+    Parameters
+    ----------
+    K : int
+      Size of every hyperedge added.
+    steps : int
+      Total number of nodes at the end of the simulation (the
+      hypergraph grows by one node per step after the initial K-1).
+    timing : bool
+      Whether to display progress bars and timing information.
+
+    Returns
+    -------
+    H : dict
+      The hyperedges, as {edge_index: edge (tuple of nodes)}.
+    D : collections.Counter
+      Degree frequency distribution: maps each observed degree to the
+      number of nodes with that degree.
+    Betti : ndarray, shape (4, timer+1)
+      Betti[k][t] is the k-th Betti number at timestep t.
+    SimplexCounts : ndarray
+      Simplex counts by size at each timestep (see PH_add_e).
+    Euler : ndarray, shape (timer+1,)
+      Euler characteristic at each timestep.
     """
     if timing:
         print("(1/5) Initializing hypergraph, variables and data structures",flush=True)
@@ -1389,7 +1909,41 @@ def HG_PreferentialAttachment_kUnif(K, steps, timing=False):
 
 def HG_PreferentialAttachment_Simplicial(K, p, steps, timing=False):
     """
+    Simulates a simpliciality-enforcing variant of the linear
+    preferential-attachment hypergraph model: as in
+    HG_PreferentialAttachment_kUnif, a new node forms a size-K
+    hyperedge with K-1 preferentially-chosen existing nodes at each
+    step, but additionally each proper sub-edge of size 2 to K-1 of
+    the new hyperedge is independently added as its own explicit edge
+    with probability p, increasing sigma_SF. Computes persistent
+    homology of the downward-closure complex as it grows.
 
+    Parameters
+    ----------
+    K : int
+      Size of the new preferentially-attached hyperedge at each step.
+    p : float
+      Probability of independently adding each proper sub-edge of a
+      new hyperedge as an explicit edge.
+    steps : int
+      Total number of nodes at the end of the simulation (the
+      hypergraph grows by one node per step after the initial K-1).
+    timing : bool
+      Whether to display progress bars and timing information.
+
+    Returns
+    -------
+    H : dict
+      The hyperedges, as {edge_index: edge (tuple of nodes)}.
+    D : collections.Counter
+      Degree frequency distribution: maps each observed degree to the
+      number of nodes with that degree.
+    Betti : ndarray, shape (4, timer+1)
+      Betti[k][t] is the k-th Betti number at timestep t.
+    SimplexCounts : ndarray
+      Simplex counts by size at each timestep (see PH_add_e).
+    Euler : ndarray, shape (timer+1,)
+      Euler characteristic at each timestep.
     """
     if timing:
         print("(1/5) Initializing hypergraph, variables and data structures",flush=True)
@@ -1471,8 +2025,38 @@ def HG_PreferentialAttachment_Simplicial(K, p, steps, timing=False):
 
 def HG_NL_PreferentialAttachment_kUnif(K, steps, alpha = 1.0, timing=False):
     """
-    Input:
-    Output: Hypergraph dictionary H along with the degree frequency distribution D.
+    Simulates a nonlinear preferential-attachment hypergraph model:
+    like HG_PreferentialAttachment_kUnif, but a node's attachment
+    weight is its degree raised to the power alpha (alpha=1 recovers
+    linear preferential attachment; alpha=0 recovers uniform/random
+    attachment). Computes persistent homology of the downward-closure
+    complex as it grows.
+
+    Parameters
+    ----------
+    K : int
+      Size of every hyperedge added.
+    steps : int
+      Total number of nodes at the end of the simulation (the
+      hypergraph grows by one node per step after the initial K-1).
+    alpha : float
+      Nonlinear preferential-attachment exponent applied to node degree.
+    timing : bool
+      Whether to display progress bars and timing information.
+
+    Returns
+    -------
+    H : dict
+      The hyperedges, as {edge_index: edge (tuple of nodes)}.
+    D : collections.Counter
+      Degree frequency distribution: maps each observed degree to the
+      number of nodes with that degree.
+    Betti : ndarray, shape (4, timer+1)
+      Betti[k][t] is the k-th Betti number at timestep t.
+    SimplexCounts : ndarray
+      Simplex counts by size at each timestep (see PH_add_e).
+    Euler : ndarray, shape (timer+1,)
+      Euler characteristic at each timestep.
     """
     if timing:
         print("(1/5) Initializing hypergraph, variables and data structures",flush=True)
@@ -1552,12 +2136,33 @@ def HG_NL_PreferentialAttachment_kUnif(K, steps, alpha = 1.0, timing=False):
 
 def HG_WattsStrogatz_kUnif(n, K, timing = False):
     """
-    ...
-    Input: int n, the number of nodes in H
-           int K, the maximum allowable edge size
-           bool timing, whether to display timing information
-    Output: Betti, an array of the 0, 1 and 2 Betti numbers for each time step
-            SimplexCounts
+    Simulates a K-uniform Watts-Strogatz hypergraph model: starting
+    from a ring lattice of n size-K edges (each node's edge with its
+    K-1 nearest neighbors), edges are rewired one at a time (in
+    random order) by replacing one endpoint's neighborhood with a
+    uniformly random new set of nodes, and zigzag persistent homology
+    is computed over the resulting add/remove filtration.
+
+    Parameters
+    ----------
+    n : int
+      Number of nodes (and initial ring-lattice edges).
+    K : int
+      Size of every hyperedge.
+    timing : bool
+      Whether to display progress bars and timing information.
+
+    Returns
+    -------
+    H : dict
+      Maps timestep -> edge; positive keys are additions, negative
+      keys (offset) are the corresponding removals of rewired edges.
+    Betti : ndarray, shape (4, timer+1)
+      Betti[k][t] is the k-th Betti number at timestep t.
+    SimplexCounts : ndarray
+      Simplex counts by size at each timestep.
+    Euler : ndarray, shape (timer+1,)
+      Euler characteristic at each timestep.
     """
     if timing:
         print("(1/5) Initializing hypergraph, variables and data structures",flush=True)
@@ -1727,12 +2332,34 @@ def HG_WattsStrogatz_kUnif(n, K, timing = False):
 
 def HG_WattsStrogatz(n, K, timing = False):
     """
-    ...
-    Input: int n, the number of nodes in H
-           int K, the maximum allowable edge size
-           bool timing, whether to display timing information
-    Output: Betti, an array of the 0, 1 and 2 Betti numbers for each time step
-            SimplexCounts
+    Simulates a (nonuniform) Watts-Strogatz hypergraph model: starting
+    from a ring lattice containing, for every node and every size 2 to
+    K, the edge of that size in its neighborhood, edges are rewired
+    one at a time (in random order) by replacing one endpoint's
+    neighborhood with a uniformly random new set of nodes, and zigzag
+    persistent homology is computed over the resulting add/remove
+    filtration.
+
+    Parameters
+    ----------
+    n : int
+      Number of nodes.
+    K : int
+      Maximum hyperedge size in the initial ring lattice.
+    timing : bool
+      Whether to display progress bars and timing information.
+
+    Returns
+    -------
+    H : dict
+      Maps timestep -> edge; positive keys are additions, negative
+      keys (offset) are the corresponding removals of rewired edges.
+    Betti : ndarray, shape (4, timer+1)
+      Betti[k][t] is the k-th Betti number at timestep t.
+    SimplexCounts : ndarray
+      Simplex counts by size at each timestep.
+    Euler : ndarray, shape (timer+1,)
+      Euler characteristic at each timestep.
     """
     if timing:
         print("(1/5) Initializing hypergraph, variables and data structures",flush=True)
@@ -1906,12 +2533,39 @@ def HG_WattsStrogatz(n, K, timing = False):
 
 def HG_WattsStrogatz_Simplicial(n, K, p, timing = False):
     """
-    ...
-    Input: int n, the number of nodes in H
-           int K, the maximum allowable edge size
-           bool timing, whether to display timing information
-    Output: Betti, an array of the 0, 1 and 2 Betti numbers for each time step
-            SimplexCounts
+    Simulates a simpliciality-enforcing K-uniform Watts-Strogatz
+    hypergraph model: starting from a ring lattice of size-K edges,
+    each node also independently gains extra sub-edges (of size 2 to
+    K-1, within its K-neighborhood) with probability p, increasing
+    sigma_SF. Edges are then rewired one at a time (in random order,
+    replacing one endpoint's neighborhood with a uniformly random new
+    set of nodes), and zigzag persistent homology is computed over
+    the resulting add/remove filtration (restricted to simplices of
+    size <= 4).
+
+    Parameters
+    ----------
+    n : int
+      Number of nodes.
+    K : int
+      Size of the base ring-lattice hyperedges.
+    p : float
+      Probability of independently adding each extra sub-edge within
+      a node's K-neighborhood.
+    timing : bool
+      Whether to display progress bars and timing information.
+
+    Returns
+    -------
+    H : dict
+      Maps timestep -> edge; positive keys are additions, negative
+      keys (offset) are the corresponding removals of rewired edges.
+    Betti : ndarray, shape (4, timer+1)
+      Betti[k][t] is the k-th Betti number at timestep t.
+    SimplexCounts : ndarray
+      Simplex counts by size at each timestep.
+    Euler : ndarray, shape (timer+1,)
+      Euler characteristic at each timestep.
     """
     if timing:
         print("(1/5) Initializing hypergraph, variables and data structures",flush=True)
@@ -2097,8 +2751,32 @@ def HG_WattsStrogatz_Simplicial(n, K, p, timing = False):
 
 def PA_Poisson_Binomial_HypergraphModel(lam, p, steps, timing=False): # P_x = 'default',
   """
-  Input: 
-  Output: Hypergraph dictionary H along with the degree frequency distribution D.
+  Simulates the PA (preferential attachment) hypergraph model with
+  stochastic hyperedge sizes: at each step, hyperedge size Y_t is
+  drawn Poisson(lam), and the number of new nodes X_t is drawn
+  Binomial(Y_t, p) (per CLAUDE.md, p = E[X_t]/E[Y_t] is the model's
+  defining ratio); the remaining Y_t - X_t hyperedge members are
+  existing nodes chosen with probability proportional to degree.
+
+  Parameters
+  ----------
+  lam : float
+    Poisson mean hyperedge size (also the initial hyperedge/node count).
+  p : float
+    Binomial success probability governing the expected fraction of
+    each hyperedge that is new nodes; p = E[X_t]/E[Y_t].
+  steps : int
+    Number of steps (hyperedges added after the initial one) to simulate.
+  timing : bool
+    Whether to display a progress bar.
+
+  Returns
+  -------
+  H : dict
+    The hyperedges, as {step: edge (list of nodes)}.
+  D : collections.Counter
+    Degree frequency distribution: maps each observed degree to the
+    number of nodes with that degree.
   """
 
   # Initialize node list V, and hypergraph as a dictionary will lam many
@@ -2146,8 +2824,28 @@ def PA_Poisson_Binomial_HypergraphModel(lam, p, steps, timing=False): # P_x = 'd
 
 def PA_Dist_From_Data_HypergraphModel(Xt, Yt, timing=False):
   """
-  Input:
-  Output: Hypergraph dictionary H along with the degree frequency distribution D.
+  Simulates the PA (preferential attachment) hypergraph model driven
+  by empirical X_t/Y_t sequences (e.g. from Extract_XtYt) rather than
+  a parametric distribution: at each step, the hyperedge has size
+  Yt[step] with Xt[step] new nodes, and the remaining members are
+  existing nodes chosen with probability proportional to degree.
+
+  Parameters
+  ----------
+  Xt : sequence of int
+    Number of new nodes to add at each step.
+  Yt : sequence of int
+    Hyperedge size at each step.
+  timing : bool
+    Whether to display a progress bar.
+
+  Returns
+  -------
+  H : dict
+    The hyperedges, as {step: edge (list of nodes)}.
+  D : collections.Counter
+    Degree frequency distribution: maps each observed degree to the
+    number of nodes with that degree.
   """
 
   # Initialize node list V, and hypergraph as a dictionary will max(Yt) many
@@ -2190,8 +2888,28 @@ def PA_Dist_From_Data_HypergraphModel(Xt, Yt, timing=False):
 
 def RA_Dist_From_Data_HypergraphModel(Xt, Yt, timing=False):
   """
-  Input:
-  Output: Hypergraph dictionary H along with the degree frequency distribution D.
+  Simulates the RA (random attachment) hypergraph model driven by
+  empirical X_t/Y_t sequences (e.g. from Extract_XtYt): identical to
+  PA_Dist_From_Data_HypergraphModel except existing hyperedge members
+  are chosen uniformly at random among all nodes, rather than with
+  probability proportional to degree.
+
+  Parameters
+  ----------
+  Xt : sequence of int
+    Number of new nodes to add at each step.
+  Yt : sequence of int
+    Hyperedge size at each step.
+  timing : bool
+    Whether to display a progress bar.
+
+  Returns
+  -------
+  H : dict
+    The hyperedges, as {step: edge (list of nodes)}.
+  D : collections.Counter
+    Degree frequency distribution: maps each observed degree to the
+    number of nodes with that degree.
   """
 
   # Initialize node list V, and hypergraph as a dictionary
@@ -2229,12 +2947,31 @@ def RA_Dist_From_Data_HypergraphModel(Xt, Yt, timing=False):
 
 def Nonlinear_PA_Dist_From_Data_HypergraphModel(Xt, Yt, alpha=1.0, timing=False):
     """
-    Input:
-         Xt - list of number of new nodes to add at each step
-         Yt - list of hyperedge sizes at each step
-         alpha - nonlinear preferential attachment parameter
-         timing - boolean to show progress bar
-    Output: Hypergraph dictionary H along with the degree frequency distribution D.
+    Simulates a nonlinear-preferential-attachment hypergraph model
+    driven by empirical X_t/Y_t sequences (e.g. from Extract_XtYt):
+    like PA_Dist_From_Data_HypergraphModel, but existing hyperedge
+    members are chosen with probability proportional to degree raised
+    to the power alpha (alpha=1 recovers linear preferential
+    attachment).
+
+    Parameters
+    ----------
+    Xt : sequence of int
+      Number of new nodes to add at each step.
+    Yt : sequence of int
+      Hyperedge size at each step.
+    alpha : float
+      Nonlinear preferential-attachment exponent applied to node degree.
+    timing : bool
+      Whether to display a progress bar.
+
+    Returns
+    -------
+    H : dict
+      The hyperedges, as {step: edge (list of nodes)}.
+    D : collections.Counter
+      Degree frequency distribution: maps each observed degree to the
+      number of nodes with that degree.
     """
 
     num_nodes = Yt[0]
@@ -2285,6 +3022,22 @@ def Nonlinear_PA_Dist_From_Data_HypergraphModel(Xt, Yt, alpha=1.0, timing=False)
     return H, D
 
 def RandomShuffling(filename):
+  """
+  Null-model shuffle: replaces each hyperedge with a uniformly random
+  set of nodes of the same size, drawn from the hypergraph's node set
+  (without regard to node degree).
+
+  Parameters
+  ----------
+  filename : str or dict
+    Path to a gzip-pickled hypergraph dict {edge_id: nodes}, or the
+    hypergraph dict itself.
+
+  Returns
+  -------
+  H : dict
+    The shuffled hypergraph, with the same edge sizes as the input.
+  """
   if type(filename) == dict:
     H = filename
   else:
@@ -2308,6 +3061,23 @@ def RandomShuffling(filename):
   return H
 
 def ProportionalShuffling(filename):
+  """
+  Null-model shuffle: replaces each hyperedge with a set of nodes of
+  the same size, drawn with probability proportional to each node's
+  original hyperdegree (using a repeated-nodes sampling list), so the
+  shuffled hypergraph approximately preserves the degree distribution.
+
+  Parameters
+  ----------
+  filename : str or dict
+    Path to a gzip-pickled hypergraph dict {edge_id: nodes}, or the
+    hypergraph dict itself.
+
+  Returns
+  -------
+  H : dict
+    The shuffled hypergraph, with the same edge sizes as the input.
+  """
   if type(filename) == dict:
     H = filename
   else:
@@ -2332,6 +3102,24 @@ def ProportionalShuffling(filename):
   return H
 
 def TemporalShuffling(filename):
+  """
+  Null-model shuffle: randomly permutes the order in which existing
+  hyperedges (nodes unchanged) were added, relabeling timesteps 0..N-1
+  accordingly. Node composition of each edge is preserved; only
+  arrival order changes.
+
+  Parameters
+  ----------
+  filename : str or dict
+    Path to a gzip-pickled hypergraph dict {edge_id: nodes}, or the
+    hypergraph dict itself.
+
+  Returns
+  -------
+  H_shuffled : dict
+    The hypergraph with the same edges, keyed by their new
+    (randomly permuted) timestep order.
+  """
   if type(filename) == dict:
     H = filename
   else:
@@ -2350,6 +3138,26 @@ def TemporalShuffling(filename):
   return H_shuffled
 
 def HyperdegreePreservingShuffling(filename, numSwaps):
+  """
+  Null-model shuffle: performs numSwaps random pairwise node swaps
+  between two distinct hyperedges of the same size (each swap
+  exchanges one node's membership between the pair), which exactly
+  preserves every node's hyperdegree (number of edges it belongs to)
+  while randomizing hyperedge composition.
+
+  Parameters
+  ----------
+  filename : str or dict
+    Path to a gzip-pickled hypergraph dict {edge_id: nodes}, or the
+    hypergraph dict itself.
+  numSwaps : int
+    Number of random pairwise node swaps to perform.
+
+  Returns
+  -------
+  H : dict
+    The shuffled hypergraph, with node hyperdegrees preserved.
+  """
   if type(filename) == dict:
     H = filename
   else:
@@ -2386,6 +3194,24 @@ def HyperdegreePreservingShuffling(filename, numSwaps):
   return H
 
 def LayerPreservingShuffling(filename):
+  """
+  Null-model shuffle: within each "layer" (the set of hyperedges of a
+  given size), applies one shared uniformly-random relabeling of the
+  node set to all hyperedges in that layer. Preserves the size of
+  every hyperedge and the internal structure within each layer, while
+  randomizing which physical nodes occupy which role.
+
+  Parameters
+  ----------
+  filename : str or dict
+    Path to a gzip-pickled hypergraph dict {edge_id: nodes}, or the
+    hypergraph dict itself.
+
+  Returns
+  -------
+  H : dict
+    The shuffled hypergraph, with the same edge sizes as the input.
+  """
   if type(filename) == dict:
     H = filename
   else:
@@ -2423,9 +3249,24 @@ def LayerPreservingShuffling(filename):
 
 def PC_HG_ErdosRenyi(params):
   """
-  Parallel function which is iteratively called,
-  looping over a set of parameters, with the current
-  iteration of parameters being params.
+  Worker function for parallel (joblib) sweeps of the Erdos-Renyi
+  hypergraph models: runs HG_ErdosRenyi_kUnif or HG_ErdosRenyi for
+  one parameter combination, computes simpliciality time series via
+  simpliciality_process_hypergraph, and pickles the result. Skips
+  the run if its output file already exists.
+
+  Parameters
+  ----------
+  params : tuple
+    (n, k, p, iteration, model), where n is node count, k is edge
+    size (kunif) or max edge size (regular), p is edge probability,
+    iteration is the run index, and model is 'kunif' or 'regular'.
+
+  Returns
+  -------
+  int
+    0 in all cases. Results are written to a filename derived from
+    params rather than returned directly.
   """
   # Grab parameter values from params list
   n = params[0]; k = params[1]; p = params[2]; iteration = params[3]; model = params[4]
@@ -2460,9 +3301,24 @@ def PC_HG_ErdosRenyi(params):
 
 def PC_HG_WattsStrogatz(params):
   """
-  Parallel function which is iteratively called,
-  looping over a set of parameters, with the current
-  iteration of parameters being params.
+  Worker function for parallel (joblib) sweeps of the Watts-Strogatz
+  hypergraph models: runs HG_WattsStrogatz_kUnif or HG_WattsStrogatz
+  for one parameter combination (computing simpliciality time series
+  for the 'regular' model), and pickles the result. Skips the run if
+  its output file already exists.
+
+  Parameters
+  ----------
+  params : tuple
+    (n, k, iteration, model), where n is node count, k is edge size
+    (kunif) or max edge size (regular), iteration is the run index,
+    and model is 'kunif' or 'regular'.
+
+  Returns
+  -------
+  int
+    0 in all cases. Results are written to a filename derived from
+    params rather than returned directly.
   """
   # Grab parameter values from params list
   n = params[0]; k = params[1]; iteration = params[2]; model = params[3]
@@ -2494,9 +3350,24 @@ def PC_HG_WattsStrogatz(params):
 
 def PC_HG_Simplicial_WattsStrogatz(params):
   """
-  Parallel function which is iteratively called,
-  looping over a set of parameters, with the current
-  iteration of parameters being params.
+  Worker function for parallel (joblib) sweeps of the
+  simpliciality-enforcing Watts-Strogatz hypergraph model: runs
+  HG_WattsStrogatz_Simplicial for one parameter combination, computes
+  simpliciality time series (discarding the first third of steps as
+  burn-in), and pickles the result. Skips the run if its output file
+  already exists.
+
+  Parameters
+  ----------
+  params : tuple
+    (n, k, p, iteration): node count, edge size, sub-edge inclusion
+    probability, and run index.
+
+  Returns
+  -------
+  int
+    0 in all cases. Results are written to a filename derived from
+    params rather than returned directly.
   """
   # Grab parameter values from params list
   n = params[0]; k = params[1]; p = params[2]; iteration = params[3];
@@ -2518,9 +3389,24 @@ def PC_HG_Simplicial_WattsStrogatz(params):
 
 def PC_HG_BarabasiAlbert(params):
   """
-  Parallel function which is iteratively called,
-  looping over a set of parameters, with the current
-  iteration of parameters being params.
+  Worker function for parallel (joblib) sweeps of the (linear or
+  simpliciality-enforcing) preferential-attachment hypergraph model:
+  runs HG_PreferentialAttachment_Simplicial for one parameter
+  combination, computes simpliciality time series, and pickles the
+  result. Skips the run if its output file already exists.
+
+  Parameters
+  ----------
+  params : tuple
+    (n, k, p, iteration): final node count, hyperedge size,
+    sub-edge inclusion probability (0 for the plain, non-simplicial
+    model), and run index.
+
+  Returns
+  -------
+  int
+    0 in all cases. Results are written to a filename derived from
+    params rather than returned directly.
   """
   # Grab parameter values from params list
   n = params[0]; k = params[1]; p = params[2]; iteration = params[3];
@@ -2546,13 +3432,27 @@ def PC_HG_BarabasiAlbert(params):
 
 def PC_HG_NL_BarabasiAlbert(params):
   """
-  Parallel function which is iteratively called,
-  looping over a set of parameters, with the current
-  iteration of parameters being params.
+  Worker function for parallel (joblib) sweeps of the nonlinear
+  preferential-attachment hypergraph model: runs
+  HG_NL_PreferentialAttachment_kUnif for one parameter combination
+  and pickles the result (alpha=1 is filed as "BA", alpha=0 as "RA",
+  other alpha as "Nonlinear_BA"). Skips the run if its output file
+  already exists.
+
+  Parameters
+  ----------
+  params : tuple
+    (n, k, alpha, iteration): final node count, hyperedge size,
+    nonlinear preferential-attachment exponent, and run index.
+
+  Returns
+  -------
+  int
+    0 in all cases. Results are written to a filename derived from
+    params rather than returned directly.
   """
   # Grab parameter values from params list
   n = params[0]; k = params[1]; alpha = params[2]; iteration = params[3];
-  print(n)
   # Create filename from params
   if alpha == 1:
     filename = 'Hypergraphs/BarabasiAlbert/BA_'+str(n)+'_'+str(k)+'_'+str(iteration)+'.pkl'
@@ -2573,9 +3473,24 @@ def PC_HG_NL_BarabasiAlbert(params):
 
 def PC_PA_Poisson_Binomial_HypergraphModel(params):
   """
-  Parallel function which is iteratively called,
-  looping over a set of parameters, with the current
-  iteration of parameters being params.
+  Worker function for parallel (joblib) sweeps of the PA
+  Poisson-Binomial hypergraph model: runs
+  PA_Poisson_Binomial_HypergraphModel for one parameter combination
+  (choosing the step count so the expected terminal node count is at
+  least N) and pickles the result. Skips the run if its output file
+  already exists.
+
+  Parameters
+  ----------
+  params : tuple
+    (lam, p, N, iteration): Poisson mean hyperedge size, PA ratio
+    p = E[X_t]/E[Y_t], target minimum expected node count, and run index.
+
+  Returns
+  -------
+  int
+    0 in all cases. Results are written to a filename derived from
+    params rather than returned directly.
   """
   # Grab parameter values from params list
   lam = params[0]; p = params[1]; N = params[2]; iteration = params[3]
@@ -2595,6 +3510,25 @@ def PC_PA_Poisson_Binomial_HypergraphModel(params):
   return 0
   
 def PC_Simplices_Euler(params):
+  """
+  Worker function for parallel (joblib) computation of simplex counts
+  and Euler characteristic time series for one PA Poisson-Binomial
+  hypergraph run, via Get_SimplexCounts_EulerChar. Skips the run if
+  its processed output file already exists.
+
+  Parameters
+  ----------
+  params : tuple
+    (lam, p, N, iteration): Poisson mean hyperedge size, PA ratio,
+    target node count, and run index, used to locate the input file
+    and name the processed output file.
+
+  Returns
+  -------
+  int
+    1 if the output already existed and was skipped; otherwise the
+    return value of Get_SimplexCounts_EulerChar (0 on success).
+  """
   lam, p, N, iteration = params
 
   # Check whether this data has been processed already
@@ -2609,6 +3543,25 @@ def PC_Simplices_Euler(params):
   return results
 
 def PC_SimplicialFraction(params):
+  """
+  Worker function for parallel (joblib) computation of sigma_SF
+  (simplicial fraction) for one PA Poisson-Binomial hypergraph run,
+  via Get_Simpliciality_SF. Skips the run if its processed output
+  file already exists.
+
+  Parameters
+  ----------
+  params : tuple
+    (lam, p, N, iteration): Poisson mean hyperedge size, PA ratio,
+    target node count, and run index, used to locate the input file
+    and name the processed output file.
+
+  Returns
+  -------
+  results : int or list
+    1 if the output already existed and was skipped; otherwise the
+    [sigma_SF, Lengths] result of Get_Simpliciality_SF.
+  """
   lam, p, N, iteration = params
 
   # Check whether this data has been processed already
@@ -2623,6 +3576,26 @@ def PC_SimplicialFraction(params):
   return results
 
 def PC_PA_From_Data(params):
+  """
+  Worker function for parallel (joblib) simulation of the PA
+  (preferential attachment) hypergraph model driven by empirical
+  X_t/Y_t data (from process_dataset's output): runs
+  PA_Dist_From_Data_HypergraphModel and pickles the result. Skips the
+  run if its output file already exists.
+
+  Parameters
+  ----------
+  params : tuple
+    (name, step): the source dataset name (used to load its X_t/Y_t
+    sequences) and a step label used only to name the output file.
+
+  Returns
+  -------
+  int
+    1 if the output already existed and was skipped; otherwise 0
+    after saving. Results are written to a filename derived from
+    params rather than returned directly.
+  """
   name, step = params
 
   filename = 'Hypergraphs/PA_From_Data/'+str(name)+'/PA_'+str(name)+'_'+str(step)+'.pkl'
@@ -2649,6 +3622,26 @@ def PC_PA_From_Data(params):
   return 0
 
 def PC_RA_From_Data(params):
+  """
+  Worker function for parallel (joblib) simulation of the RA (random
+  attachment) hypergraph model driven by empirical X_t/Y_t data (from
+  process_dataset's output): runs RA_Dist_From_Data_HypergraphModel
+  and pickles the result. Skips the run if its output file already
+  exists.
+
+  Parameters
+  ----------
+  params : tuple
+    (name, step): the source dataset name (used to load its X_t/Y_t
+    sequences) and a step label used only to name the output file.
+
+  Returns
+  -------
+  int
+    1 if the output already existed and was skipped; otherwise 0
+    after saving. Results are written to a filename derived from
+    params rather than returned directly.
+  """
   name, step = params
 
   filename = 'Hypergraphs/RA_From_Data/'+str(name)+'/RA_'+str(name)+'_'+str(step)+'.pkl'
@@ -2675,6 +3668,27 @@ def PC_RA_From_Data(params):
   return 0
 
 def PC_Nonlinear_PA_From_Data(params):
+  """
+  Worker function for parallel (joblib) simulation of the nonlinear
+  preferential-attachment hypergraph model driven by empirical
+  X_t/Y_t data (from process_dataset's output): runs
+  Nonlinear_PA_Dist_From_Data_HypergraphModel and pickles the result.
+  Skips the run if its output file already exists.
+
+  Parameters
+  ----------
+  params : tuple
+    (name, alpha, step): the source dataset name (used to load its
+    X_t/Y_t sequences), the nonlinear preferential-attachment
+    exponent, and a step label used only to name the output file.
+
+  Returns
+  -------
+  int or None
+    1 if the output already existed and was skipped; otherwise None
+    after saving. Results are written to a filename derived from
+    params rather than returned directly.
+  """
   name, alpha, step = params
 
   filename = 'Hypergraphs/PA_From_Data/'+str(name)+'/Nonlinear_'+f"{alpha:.1f}".replace('.','_')+'_'+str(name)+'_'+str(step)+'.pkl'
@@ -2705,6 +3719,31 @@ def PC_Nonlinear_PA_From_Data(params):
 # ============================================================================
 
 def get_filename_ER(n, k, p, iteration, model, base_path):
+    """
+    Builds the processed-output filename for one Erdos-Renyi
+    hypergraph run, matching the naming used by PC_HG_ErdosRenyi.
+
+    Parameters
+    ----------
+    n : int
+      Node count.
+    k : int
+      Edge size (kunif) or max edge size (nonuniform).
+    p : float
+      Edge probability.
+    iteration : int
+      Run index.
+    model : str
+      'kunif' or 'nonuniform'.
+    base_path : str
+      Directory to place the file in.
+
+    Returns
+    -------
+    str or None
+      The full file path, or None if model is neither 'kunif' nor
+      'nonuniform'.
+    """
     if model == 'kunif':
         return os.path.join(
             base_path,
@@ -2717,6 +3756,21 @@ def get_filename_ER(n, k, p, iteration, model, base_path):
         )
 
 def load_single_er(filename):
+    """
+    Loads one gzip-pickled Erdos-Renyi hypergraph result file,
+    tolerating a missing or corrupted file.
+
+    Parameters
+    ----------
+    filename : str
+      Path to the gzip-pickled result file.
+
+    Returns
+    -------
+    object or None
+      The unpickled result, or None if the file is missing or
+      corrupted (in which case a message is printed for corruption).
+    """
     if not os.path.isfile(filename):
         return None
     try:
@@ -2727,6 +3781,29 @@ def load_single_er(filename):
         return None
 
 def get_filename_ws(n, k, p, iteration, base_path):
+    """
+    Builds the filename for one simpliciality-enforcing Watts-Strogatz
+    hypergraph run, matching the naming used by
+    PC_HG_Simplicial_WattsStrogatz.
+
+    Parameters
+    ----------
+    n : int
+      Node count.
+    k : int
+      Hyperedge size.
+    p : float
+      Sub-edge inclusion probability.
+    iteration : int
+      Run index.
+    base_path : str
+      Directory to place the file in.
+
+    Returns
+    -------
+    str
+      The full file path.
+    """
     return os.path.join(
         base_path,
         f'WS_Simplicial_{n}_{k}_{str(p).replace(".","_")}_{iteration}.pkl'
@@ -2734,8 +3811,43 @@ def get_filename_ws(n, k, p, iteration, base_path):
 
 def load_single_ws(n, k, p, iteration, base_path, WS_fields):
     """
-    Load one file and return all derived quantities.
-    Returns (n, k, p_key, iteration, field_dict, status).
+    Loads one Watts-Strogatz hypergraph result file and derives its
+    cycle rank fields (CR_1 via cyclerank_1, and CR_1 - beta_1),
+    tolerating a missing or corrupted file.
+
+    Parameters
+    ----------
+    n : int
+      Node count.
+    k : int
+      Hyperedge size.
+    p : float
+      Sub-edge inclusion probability.
+    iteration : int
+      Run index.
+    base_path : str
+      Directory the file is located in.
+    WS_fields : list of str
+      Field names corresponding, in order, to the entries of the
+      pickled result tuple (must include 'Betti' and 'SimplexCounts').
+
+    Returns
+    -------
+    n : int
+      Echoed input node count.
+    k : int
+      Echoed input hyperedge size.
+    p_key : float
+      p rounded to 4 decimal places, for use as a dict key.
+    iteration : int
+      Echoed input run index.
+    field_dict : dict or None
+      Maps each name in WS_fields to its loaded value, plus
+      'CycleRank' (CR_1) and 'CycleRank_minus_Betti1' (CR_1 - beta_1)
+      if Betti and SimplexCounts are both present; None if the file
+      is missing or corrupted.
+    status : str
+      'ok', 'missing', or 'corrupted: <ExceptionType>'.
     """
     p_key    = round(p, 4)
     filename = get_filename_ws(n, k, p, iteration, base_path)
@@ -2764,6 +3876,29 @@ def load_single_ws(n, k, p, iteration, base_path, WS_fields):
     return n, k, p_key, iteration, field_dict, 'ok'
 
 def get_filename_nlba(n, k, alpha, iteration, base_path):
+    """
+    Builds the filename for one nonlinear-preferential-attachment
+    hypergraph run, matching the naming used by PC_HG_NL_BarabasiAlbert.
+
+    Parameters
+    ----------
+    n : int
+      Node count.
+    k : int
+      Hyperedge size.
+    alpha : float
+      Nonlinear preferential-attachment exponent (1 = linear PA
+      ("BA"), 0 = random attachment ("RA")).
+    iteration : int
+      Run index.
+    base_path : str
+      Directory to place the file in.
+
+    Returns
+    -------
+    str
+      The full file path.
+    """
     if alpha == 1:
         return os.path.join(base_path, f'BA_{n}_{k}_{iteration}.pkl')
     elif alpha == 0:
@@ -2776,8 +3911,43 @@ def get_filename_nlba(n, k, alpha, iteration, base_path):
 
 def load_single_nlba(n, k, alpha, iteration, base_path, NLBA_fields):
     """
-    Load one file and return all derived quantities.
-    Returns (n, k, alpha_key, iteration, field_dict, status).
+    Loads one nonlinear-preferential-attachment hypergraph result
+    file and derives its cycle rank fields (CR_1 via cyclerank_1, and
+    CR_1 - beta_1), tolerating a missing or corrupted file.
+
+    Parameters
+    ----------
+    n : int
+      Node count.
+    k : int
+      Hyperedge size.
+    alpha : float
+      Nonlinear preferential-attachment exponent.
+    iteration : int
+      Run index.
+    base_path : str
+      Directory the file is located in.
+    NLBA_fields : list of str
+      Field names corresponding, in order, to the entries of the
+      pickled result tuple (must include 'Betti' and 'SimplexCounts').
+
+    Returns
+    -------
+    n : int
+      Echoed input node count.
+    k : int
+      Echoed input hyperedge size.
+    alpha_key : float
+      alpha rounded to 4 decimal places, for use as a dict key.
+    iteration : int
+      Echoed input run index.
+    field_dict : dict or None
+      Maps each name in NLBA_fields to its loaded value, plus
+      'CycleRank' (CR_1) and 'CycleRank_minus_Betti1' (CR_1 - beta_1)
+      if Betti and SimplexCounts are both present; None if the file
+      is missing or corrupted.
+    status : str
+      'ok', 'missing', or 'corrupted: <ExceptionType>'.
     """
     alpha_key = round(alpha, 4)
     filename  = get_filename_nlba(n, k, alpha, iteration, base_path)
@@ -2807,42 +3977,190 @@ def load_single_nlba(n, k, alpha, iteration, base_path, NLBA_fields):
     return n, k, alpha_key, iteration, field_dict, 'ok'
 
 def sc_col(sc, dim):
+    """
+    Extracts one dimension's simplex-count time series from a
+    SimplexCounts result, which per CLAUDE.md is a list of lists
+    (possibly ragged across timesteps), NOT a 2D numpy array.
+
+    Parameters
+    ----------
+    sc : list of list of float
+      SimplexCounts time series; sc[t] is the row of simplex counts
+      by size at timestep t.
+    dim : int
+      Column index (simplex size - 1) to extract.
+
+    Returns
+    -------
+    ndarray
+      1-D array, one entry per timestep, with 0.0 where a row is too
+      short to have that column.
+    """
     return np.array([
         row[dim] if len(row) > dim else 0.0
         for row in sc
     ], dtype=float)
 
 def cyclerank_1(betti, sc):
+    """
+    Computes the CR_1 (cycle rank) time series: CR_1 = N_1 - N_0 + beta_0.
+
+    Parameters
+    ----------
+    betti : ndarray
+      Betti[k][t] is the k-th Betti number at timestep t.
+    sc : list of list of float
+      SimplexCounts time series (see sc_col).
+
+    Returns
+    -------
+    ndarray
+      1-D array of CR_1 at each timestep.
+    """
     return sc_col(sc, 1) - sc_col(sc, 0) + betti[0].astype(float)
 
 def cyclerank_2(betti, sc):
+    """
+    Computes the CR_2 time series, extending CR_1's construction one
+    dimension up: CR_2 = N_2 - CR_1 + beta_1.
+
+    Parameters
+    ----------
+    betti : ndarray
+      Betti[k][t] is the k-th Betti number at timestep t.
+    sc : list of list of float
+      SimplexCounts time series (see sc_col).
+
+    Returns
+    -------
+    ndarray
+      1-D array of CR_2 at each timestep.
+    """
     return sc_col(sc, 2) - cyclerank_1(betti, sc) + betti[1].astype(float)
 
 def cR2_terminal(betti, sc):
+    """
+    Computes CR_2 = N_2 - CR_1 + beta_1 (see cyclerank_2) at only the
+    final timestep, as a scalar.
+
+    Parameters
+    ----------
+    betti : ndarray
+      Betti[k][t] is the k-th Betti number at timestep t.
+    sc : list of list of float
+      SimplexCounts time series (see sc_col); indexed here as a 2D
+      array, so must not be ragged.
+
+    Returns
+    -------
+    float
+      CR_2 at the final timestep.
+    """
     N2  = float(sc[-1, 2])
     CR1 = float(sc[-1, 1] - sc[-1, 0] + betti[0][-1])
     b1  = float(betti[1][-1])
     return N2 - CR1 + b1
 
 def tb1(betti, sc):
+    """
+    Computes the normalized Betti number beta_tilde_1 = beta_1 / N_1
+    time series.
+
+    Parameters
+    ----------
+    betti : ndarray
+      Betti[k][t] is the k-th Betti number at timestep t.
+    sc : list of list of float
+      SimplexCounts time series (see sc_col).
+
+    Returns
+    -------
+    ndarray
+      1-D array of beta_tilde_1 at each timestep (NaN where N_1 is 0).
+    """
     b1 = betti[1].astype(float)
     s1 = sc_col(sc, 1)
     L  = min(len(b1), len(s1))
     return np.where(s1[:L] > 0, b1[:L] / s1[:L], np.nan)
 
 def tb2(betti, sc):
+    """
+    Computes the normalized Betti number beta_tilde_2 = beta_2 / N_2
+    time series.
+
+    Parameters
+    ----------
+    betti : ndarray
+      Betti[k][t] is the k-th Betti number at timestep t.
+    sc : list of list of float
+      SimplexCounts time series (see sc_col).
+
+    Returns
+    -------
+    ndarray
+      1-D array of beta_tilde_2 at each timestep (NaN where N_2 is 0).
+    """
     b2 = betti[2].astype(float)
     s2 = sc_col(sc, 2)
     L  = min(len(b2), len(s2))
     return np.where(s2[:L] > 0, b2[:L] / s2[:L], np.nan)
 
 def build_heatmap(data, n_plot, n_q, k, q_common, field_fn, p_keys):
+    """
+    Builds a 2-D heatmap array of a field's mean trajectory (see
+    mean_term_traj) across a range of p values.
+
+    Parameters
+    ----------
+    data : dict
+      Nested results dict indexed as data[n_plot][k][p].
+    n_plot : int
+      Node count to select.
+    n_q : int
+      Number of points in the common q (rewiring probability) grid.
+    k : int
+      Hyperedge size to select.
+    q_common : ndarray
+      Common q grid to interpolate trajectories onto.
+    field_fn : callable
+      Function (betti, sc) -> 1-D trajectory, e.g. tb1 or tb2.
+    p_keys : list
+      p values (rows of the heatmap), in order.
+
+    Returns
+    -------
+    ndarray, shape (len(p_keys), n_q)
+      Row p_keys[i] is the mean field_fn trajectory for that p value.
+    """
     rows = []
     for p in p_keys:
         rows.append(mean_term_traj(data, n_plot, n_q, k, q_common, field_fn, p))
     return np.array(rows)   # (n_p, n_q)
 
 def extract_CCDF(N, lam, p, iterations):
+    """
+    Aggregates node degree distributions across multiple PA
+    Poisson-Binomial hypergraph runs and computes the complementary
+    cumulative distribution function (CCDF) of hyperdegree.
+
+    Parameters
+    ----------
+    N : int
+      Target node count parameter used to locate input files.
+    lam : float
+      Poisson mean hyperedge size parameter used to locate input files.
+    p : float
+      PA ratio parameter used to locate input files.
+    iterations : iterable of int
+      Run indices to aggregate over.
+
+    Returns
+    -------
+    None
+      Writes the CCDF array (indexed by degree) to a processed
+      output file; does not return a value. Skipped entirely if that
+      output file already exists.
+    """
     # Check whether this data has been processed already
     processed_filename = 'Hypergraphs/Processed/CCDF/PA_Poisson_Binomial_HypergraphModel_CCDF_'+str(lam)+'_'+str(p).replace('.','_')+'_'+str(N)+'.pkl'
     if os.path.isfile(processed_filename):
@@ -2882,6 +4200,28 @@ def extract_CCDF(N, lam, p, iterations):
       pickle.dump(P_PB_HG_c, f)
 
 def load_ccdf(N, lam, p):
+    """
+    Loads one CCDF result file produced by extract_CCDF, tolerating
+    load failures.
+
+    Parameters
+    ----------
+    N : int
+      Target node count parameter used to locate the file.
+    lam : float
+      Poisson mean hyperedge size parameter used to locate the file.
+    p : float
+      PA ratio parameter used to locate the file.
+
+    Returns
+    -------
+    key : tuple
+      (lam, p), for use as a dict key.
+    ccdf : ndarray or None
+      The loaded CCDF array, or None on failure.
+    error : str or None
+      Error message on failure, else None.
+    """
     filename = (
         'Hypergraphs/Processed/CCDF/'
         f'PA_Poisson_Binomial_HypergraphModel_CCDF_{lam}_{str(p).replace(".","_")}_{N}.pkl'
@@ -2894,6 +4234,30 @@ def load_ccdf(N, lam, p):
         return (lam, p), None, str(e)
 
 def load_euler(N, lam, p, iteration):
+    """
+    Loads one simplex-counts/Euler-characteristic result file
+    produced by PC_Simplices_Euler, tolerating load failures.
+
+    Parameters
+    ----------
+    N : int
+      Target node count parameter used to locate the file.
+    lam : float
+      Poisson mean hyperedge size parameter used to locate the file.
+    p : float
+      PA ratio parameter used to locate the file.
+    iteration : int
+      Run index used to locate the file.
+
+    Returns
+    -------
+    key : tuple
+      (lam, p, iteration), for use as a dict key.
+    euler : ndarray or None
+      The loaded Euler characteristic time series, or None on failure.
+    error : str or None
+      Error message on failure, else None.
+    """
     filename = (
         'Hypergraphs/Processed/Simplices_Euler/'
         f'PA_Poisson_Binomial_HypergraphModel_Simplices_Euler_{lam}_{str(p).replace(".","_")}_{N}_{iteration}.pkl'
@@ -2906,6 +4270,32 @@ def load_euler(N, lam, p, iteration):
         return (lam, p, iteration), None, str(e)
 
 def load_sf(N, lam, p, iteration):
+    """
+    Loads one sigma_SF (simplicial fraction) result file produced by
+    PC_SimplicialFraction, tolerating load failures.
+
+    Parameters
+    ----------
+    N : int
+      Target node count parameter used to locate the file.
+    lam : float
+      Poisson mean hyperedge size parameter used to locate the file.
+    p : float
+      PA ratio parameter used to locate the file.
+    iteration : int
+      Run index used to locate the file.
+
+    Returns
+    -------
+    key : tuple
+      (lam, p, iteration), for use as a dict key.
+    sf : float or None
+      The loaded sigma_SF value, or None on failure.
+    lengths : collections.Counter or None
+      The loaded per-size downward-closed edge counts, or None on failure.
+    error : str or None
+      Error message on failure, else None.
+    """
     filename = (
         'Hypergraphs/Processed/Simpliciality/SimplicialFraction/'
         f'PA_Poisson_Binomial_HypergraphModel_SF_{lam}_{str(p).replace(".","_")}_{N}_{iteration}.pkl'
@@ -2918,6 +4308,20 @@ def load_sf(N, lam, p, iteration):
         return (lam, p, iteration), None, None, str(e)
 
 def Convert_From_XGI(name):
+  """
+  Loads a named XGI dataset and converts it to this module's plain
+  hypergraph dict representation.
+
+  Parameters
+  ----------
+  name : str
+    Name of the XGI dataset to load (passed to xgi.load_xgi_data).
+
+  Returns
+  -------
+  H_processed : dict
+    The hypergraph as {edge_index: edge (sorted tuple of nodes)}.
+  """
   H = xgi.load_xgi_data(name)
   counter = 0
   H_processed = {}
@@ -2927,6 +4331,27 @@ def Convert_From_XGI(name):
   return H_processed
 
 def load_original(name, base_path):
+    """
+    Loads the PA-model-from-data result for the original (unshuffled)
+    dataset, tolerating load failures.
+
+    Parameters
+    ----------
+    name : str
+      Dataset name used to locate the file.
+    base_path : str
+      Directory the file is located in.
+
+    Returns
+    -------
+    name : str
+      Echoed input dataset name.
+    result : object or None
+      The first element of the loaded pickle (the hypergraph result),
+      or None on failure.
+    error : str or None
+      Error message on failure, else None.
+    """
     filename = base_path + f'{name}.pkl'
     try:
         with gzip.open(filename, 'rb') as f:
@@ -2935,6 +4360,31 @@ def load_original(name, base_path):
         return name, None, str(e)
 
 def load_fromdata(name, step, base_path):
+    """
+    Loads a PA-model-from-data result (see PC_PA_From_Data),
+    tolerating load failures.
+
+    Parameters
+    ----------
+    name : str
+      Dataset name used to locate the file.
+    step : object
+      Step label used to locate the file.
+    base_path : str
+      Directory the file is located in.
+
+    Returns
+    -------
+    name : str
+      Echoed input dataset name.
+    step : object
+      Echoed input step label.
+    result : object or None
+      The first element of the loaded pickle (the hypergraph result),
+      or None on failure.
+    error : str or None
+      Error message on failure, else None.
+    """
     filename = base_path + f'{name}_{step}.pkl'
     try:
         with gzip.open(filename, 'rb') as f:
@@ -2943,6 +4393,35 @@ def load_fromdata(name, step, base_path):
         return name, step, None, str(e)
 
 def load_nonlinear(name, alpha, step, base_path):
+    """
+    Loads a nonlinear-preferential-attachment-from-data result (see
+    PC_Nonlinear_PA_From_Data), tolerating load failures.
+
+    Parameters
+    ----------
+    name : str
+      Dataset name used to locate the file.
+    alpha : float
+      Nonlinear preferential-attachment exponent used to locate the file.
+    step : object
+      Step label used to locate the file.
+    base_path : str
+      Directory the file is located in.
+
+    Returns
+    -------
+    name : str
+      Echoed input dataset name.
+    alpha : float
+      Echoed input exponent.
+    step : object
+      Echoed input step label.
+    result : object or None
+      The first element of the loaded pickle (the hypergraph result),
+      or None on failure.
+    error : str or None
+      Error message on failure, else None.
+    """
     filename = base_path + f'Nonlinear_{str(alpha).replace(".","_")}_{name}_{step}.pkl'
     try:
         with gzip.open(filename, 'rb') as f:
@@ -2951,6 +4430,41 @@ def load_nonlinear(name, alpha, step, base_path):
         return name, alpha, step, None, str(e)
 
 def load_ra_and_shuffled(name, step, base_path):
+    """
+    Loads a random-attachment-from-data sigma_SF result alongside the
+    four null-model shuffle variants' sigma_SF results (in the order
+    RandomShuffling, ProportionalShuffling, HyperdegreePreservingShuffling,
+    LayerPreservingShuffling) for the same (name, step), tolerating
+    load failures.
+
+    Parameters
+    ----------
+    name : str
+      Dataset name used to locate the files.
+    step : object
+      Step label used to locate the files.
+    base_path : str
+      Directory the files are located in.
+
+    Returns
+    -------
+    name : str
+      Echoed input dataset name.
+    step : object
+      Echoed input step label.
+    ra : object or None
+      The RA-from-data sigma_SF result, or None on failure.
+    random_shuffled : object or None
+      The RandomShuffling sigma_SF result, or None on failure.
+    proportional_shuffled : object or None
+      The ProportionalShuffling sigma_SF result, or None on failure.
+    hyperdegree_shuffled : object or None
+      The HyperdegreePreservingShuffling sigma_SF result, or None on failure.
+    layer_shuffled : object or None
+      The LayerPreservingShuffling sigma_SF result, or None on failure.
+    error : str or None
+      Error message on failure, else None.
+    """
     ra_filename  = base_path + f'RA_{name}_{step}.pkl'
     shuf_filename = base_path + f'Shuffled_{name}_{step}.pkl'
     try:
@@ -2968,6 +4482,31 @@ def load_ra_and_shuffled(name, step, base_path):
 # ============================================================================
 
 def add_discrete_cbar_n(fig, ax_target, n_cmap, n_norm, n_n, N, shrink=0.6):
+    """
+    Adds a discrete colorbar labeled by node count N to a figure.
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+      Figure to attach the colorbar to.
+    ax_target : Axes or array of Axes
+      Axes the colorbar is placed relative to.
+    n_cmap : Colormap
+      Colormap used for the N values.
+    n_norm : Normalize
+      Normalization mapping N values to [0, 1].
+    n_n : int
+      Number of discrete N values (tick count).
+    N : list
+      N values, in tick order, used as tick labels.
+    shrink : float
+      Colorbar shrink factor.
+
+    Returns
+    -------
+    cbar : matplotlib.colorbar.Colorbar
+      The created colorbar.
+    """
     sm = cm.ScalarMappable(cmap=n_cmap, norm=n_norm)
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=ax_target, shrink=shrink, pad=0.02,
@@ -2977,6 +4516,31 @@ def add_discrete_cbar_n(fig, ax_target, n_cmap, n_norm, n_n, N, shrink=0.6):
     return cbar
 
 def add_discrete_cbar_k(fig, ax_target, k_cmap, k_norm, n_k, K, shrink=0.6):
+    """
+    Adds a discrete colorbar labeled by hyperedge size K to a figure.
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+      Figure to attach the colorbar to.
+    ax_target : Axes or array of Axes
+      Axes the colorbar is placed relative to.
+    k_cmap : Colormap
+      Colormap used for the K values.
+    k_norm : Normalize
+      Normalization mapping K values to [0, 1].
+    n_k : int
+      Number of discrete K values (tick count).
+    K : list
+      K values, in tick order, used as tick labels.
+    shrink : float
+      Colorbar shrink factor.
+
+    Returns
+    -------
+    cbar : matplotlib.colorbar.Colorbar
+      The created colorbar.
+    """
     sm = cm.ScalarMappable(cmap=k_cmap, norm=k_norm)
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=ax_target, shrink=shrink, pad=0.02,
@@ -2986,6 +4550,32 @@ def add_discrete_cbar_k(fig, ax_target, k_cmap, k_norm, n_k, K, shrink=0.6):
     return cbar
 
 def add_discrete_cbar_p(fig, ax_target, p_cmap, p_norm, n_p, p_keys, shrink=0.6):
+    """
+    Adds a discrete colorbar labeled by sub-edge probability p_sub to
+    a figure, showing every other tick to avoid crowding.
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+      Figure to attach the colorbar to.
+    ax_target : Axes or array of Axes
+      Axes the colorbar is placed relative to.
+    p_cmap : Colormap
+      Colormap used for the p values.
+    p_norm : Normalize
+      Normalization mapping p values to [0, 1].
+    n_p : int
+      Number of discrete p values.
+    p_keys : list
+      p values, in tick order, used to build tick labels.
+    shrink : float
+      Colorbar shrink factor.
+
+    Returns
+    -------
+    cbar : matplotlib.colorbar.Colorbar
+      The created colorbar.
+    """
     sm = cm.ScalarMappable(cmap=p_cmap, norm=p_norm)
     sm.set_array([])
     tick_indices = np.arange(0, n_p, 2)
@@ -2996,6 +4586,34 @@ def add_discrete_cbar_p(fig, ax_target, p_cmap, p_norm, n_p, p_keys, shrink=0.6)
     return cbar
 
 def get_mean_trajectory_er(model, n, k, field_fn, data, p_ER, q_common):
+    """
+    Computes the mean, across iterations, of a field's trajectory for
+    one Erdos-Renyi model/n/k/p combination, interpolated onto a
+    common edge-density grid.
+
+    Parameters
+    ----------
+    model : str
+      'kunif' or 'nonuniform', selects the results sub-dict.
+    n : int
+      Node count to select.
+    k : int
+      Hyperedge size to select.
+    field_fn : callable
+      Function (betti, sc, cr, cr_b1, sf, fes) -> 1-D trajectory.
+    data : dict
+      Nested results dict indexed as data[model][n][k][p_ER].
+    p_ER : object
+      Key selecting the edge-probability cell.
+    q_common : ndarray
+      Common edge-density grid to interpolate trajectories onto.
+
+    Returns
+    -------
+    ndarray or None
+      Mean trajectory interpolated onto q_common, or None if no
+      iteration produced a valid trajectory.
+    """
     cell   = data[model][n][k][p_ER]
     n_iter = len(cell['Betti'])
     trajs  = []
@@ -3023,6 +4641,61 @@ def get_mean_trajectory_er(model, n, k, field_fn, data, p_ER, q_common):
 def draw_er_figure(data, base_path, N, k, fields_er, p_ER, q_common, n_colors, n_cmap, n_norm, n_n, model_ls,
                     panels, nrows, ncols, figsize, suptitle, save_prefix,
                     cbar_shrink=0.5, xlim=(0, 1)):
+    """
+    Plots a grid of panels, each showing mean field trajectories vs.
+    edge density for the Erdos-Renyi models, one line per node count N
+    (colored) and per model variant (kunif vs. nonuniform, by
+    linestyle), and saves the figure.
+
+    Parameters
+    ----------
+    data : dict
+      Nested results dict indexed as data[model][n][k][p_ER] (see
+      get_mean_trajectory_er).
+    base_path : str
+      Directory to save the figure files to.
+    N : list of int
+      Node counts to plot, one line per value.
+    k : int
+      Hyperedge size to select.
+    fields_er : dict
+      Maps each panel label to a field_fn (see get_mean_trajectory_er).
+    p_ER : object
+      Key selecting the edge-probability cell.
+    q_common : ndarray
+      Common edge-density grid to interpolate trajectories onto.
+    n_colors : dict
+      Maps each N value to a plot color.
+    n_cmap : Colormap
+      Colormap for the N colorbar.
+    n_norm : Normalize
+      Normalization for the N colorbar.
+    n_n : int
+      Number of discrete N values (colorbar tick count).
+    model_ls : dict
+      Maps each model name ('kunif', 'nonuniform') to a linestyle.
+    panels : list of list of str
+      Grid of panel labels (keys into fields_er), row-major.
+    nrows : int
+      Number of subplot rows.
+    ncols : int
+      Number of subplot columns.
+    figsize : tuple of float
+      Figure size passed to plt.subplots.
+    suptitle : str
+      Figure title.
+    save_prefix : str
+      Filename prefix (without extension) for the saved figure.
+    cbar_shrink : float
+      Colorbar shrink factor.
+    xlim : tuple of float
+      X-axis limits for each panel.
+
+    Returns
+    -------
+    None
+      Displays the figure and saves it as PDF and PNG under base_path.
+    """
     fig, axes = plt.subplots(nrows, ncols, figsize=figsize,
                              constrained_layout=True)
     axes_flat = np.array(axes).flatten()
@@ -3050,7 +4723,6 @@ def draw_er_figure(data, base_path, N, k, fields_er, p_ER, q_common, n_colors, n
     add_discrete_cbar_n(fig, axes_flat[:len(all_labels)], n_cmap, n_norm, n_n, N, shrink=cbar_shrink)
 
     # Manual legend for model linestyles
-    from matplotlib.lines import Line2D
     legend_elements = [
         Line2D([0], [0], color='grey', ls='-',  lw=1.5, label='K-uniform'),
         Line2D([0], [0], color='grey', ls='--', lw=1.5, label='Nonuniform'),
@@ -3066,8 +4738,31 @@ def draw_er_figure(data, base_path, N, k, fields_er, p_ER, q_common, n_colors, n
 
 def get_mean_trajectory_ws(data, n_plot, k, field_fn, p_key):
     """
-    Returns the mean trajectory (1-D array) over all iterations for a given k,
-    interpolated onto a common q grid of length equal to the longest trajectory.
+    Computes the mean, across iterations, of a field's trajectory for
+    one Watts-Strogatz n/k/p combination, interpolated onto a common
+    rewiring-probability grid of length equal to the longest
+    individual trajectory.
+
+    Parameters
+    ----------
+    data : dict
+      Nested results dict indexed as data[n_plot][k][p_key].
+    n_plot : int
+      Node count to select.
+    k : int
+      Hyperedge size to select.
+    field_fn : callable
+      Function (betti, sc, euler, cr, cr_b1, sf, fes) -> 1-D trajectory.
+    p_key : object
+      Key selecting the sub-edge-probability cell.
+
+    Returns
+    -------
+    q_common : ndarray or None
+      Common rewiring-probability grid, or None if no iteration
+      produced a valid trajectory.
+    mean : ndarray or None
+      Mean trajectory interpolated onto q_common, or None likewise.
     """
     cell   = data[n_plot][k][p_key]
     n_iter = len(cell['Betti'])
@@ -3101,6 +4796,56 @@ def get_mean_trajectory_ws(data, n_plot, k, field_fn, p_key):
 def draw_ws_figure(data, base_path, n_plot, k, fields_ws, k_colors, k_cmap, k_norm, n_k, K,
                    panels, nrows, ncols, figsize, suptitle, save_prefix,
                    cbar_shrink=0.5):
+    """
+    Plots a grid of panels, each showing mean field trajectories vs.
+    rewiring probability for the (non-simplicial) Watts-Strogatz
+    model at sub-edge probability 0, one line per hyperedge size in K
+    (colored), and saves the figure.
+
+    Parameters
+    ----------
+    data : dict
+      Nested results dict indexed as data[n_plot][k][p_key] (see
+      get_mean_trajectory_ws).
+    base_path : str
+      Directory to save the figure files to.
+    n_plot : int
+      Node count to select.
+    k : int
+      Placeholder loop variable name, overwritten per K value; not
+      otherwise used before being reassigned.
+    fields_ws : dict
+      Maps each panel label to a field_fn (see get_mean_trajectory_ws).
+    k_colors : dict
+      Maps each K value to a plot color.
+    k_cmap : Colormap
+      Colormap for the K colorbar.
+    k_norm : Normalize
+      Normalization for the K colorbar.
+    n_k : int
+      Number of discrete K values (colorbar tick count).
+    K : list of int
+      Hyperedge sizes to plot, one line per value.
+    panels : list of list of str
+      Grid of panel labels (keys into fields_ws), row-major.
+    nrows : int
+      Number of subplot rows.
+    ncols : int
+      Number of subplot columns.
+    figsize : tuple of float
+      Figure size passed to plt.subplots.
+    suptitle : str
+      Figure title.
+    save_prefix : str
+      Filename prefix (without extension) for the saved figure.
+    cbar_shrink : float
+      Colorbar shrink factor.
+
+    Returns
+    -------
+    None
+      Displays the figure and saves it as PDF and PNG under base_path.
+    """
     fig, axes = plt.subplots(nrows, ncols, figsize=figsize,
                              constrained_layout=True)
     axes_flat = np.array(axes).flatten()
@@ -3131,6 +4876,55 @@ def draw_ws_figure(data, base_path, n_plot, k, fields_ws, k_colors, k_cmap, k_no
 def draw_simplicial_ws_figure(data, base_path, n_plot, k, fields_ws, p_cmap, p_norm, n_p, p_keys, p_colors,
                               panels, nrows, ncols, figsize, suptitle, save_prefix,
                    cbar_shrink=0.5):
+    """
+    Plots a grid of panels, each showing mean field trajectories vs.
+    rewiring probability for the simpliciality-enforcing Watts-Strogatz
+    model at a fixed hyperedge size k, one line per sub-edge
+    probability in p_keys (colored), and saves the figure.
+
+    Parameters
+    ----------
+    data : dict
+      Nested results dict indexed as data[n_plot][k][p_key] (see
+      get_mean_trajectory_ws).
+    base_path : str
+      Directory to save the figure files to.
+    n_plot : int
+      Node count to select.
+    k : int
+      Hyperedge size to select.
+    fields_ws : dict
+      Maps each panel label to a field_fn (see get_mean_trajectory_ws).
+    p_cmap : Colormap
+      Colormap for the p_sub colorbar.
+    p_norm : Normalize
+      Normalization for the p_sub colorbar.
+    n_p : int
+      Number of discrete p values (colorbar tick count).
+    p_keys : list
+      Sub-edge probabilities to plot, one line per value.
+    p_colors : dict
+      Maps each p value to a plot color.
+    panels : list of list of str
+      Grid of panel labels (keys into fields_ws), row-major.
+    nrows : int
+      Number of subplot rows.
+    ncols : int
+      Number of subplot columns.
+    figsize : tuple of float
+      Figure size passed to plt.subplots.
+    suptitle : str
+      Figure title.
+    save_prefix : str
+      Filename prefix (without extension) for the saved figure.
+    cbar_shrink : float
+      Colorbar shrink factor.
+
+    Returns
+    -------
+    None
+      Displays the figure and saves it as PDF and PNG under base_path.
+    """
     fig, axes = plt.subplots(nrows, ncols, figsize=figsize,
                              constrained_layout=True)
     axes_flat = np.array(axes).flatten()
@@ -3159,7 +4953,35 @@ def draw_simplicial_ws_figure(data, base_path, n_plot, k, fields_ws, p_cmap, p_n
     print(f'Saved: {save_prefix}')
 
 def mean_term_traj(data, n_plot, n_q, k, q_common, field_fn, p_key):
-    """Returns 1-D array of length n_q interpolated onto q_common."""
+    """
+    Computes the mean, across iterations, of a field's trajectory for
+    one n_plot/k/p_key combination, interpolated onto a common
+    rewiring-probability grid of fixed length n_q (used by
+    build_heatmap).
+
+    Parameters
+    ----------
+    data : dict
+      Nested results dict indexed as data[n_plot][k][p_key].
+    n_plot : int
+      Node count to select.
+    n_q : int
+      Number of points in the common q grid.
+    k : int
+      Hyperedge size to select.
+    q_common : ndarray
+      Common q grid to interpolate trajectories onto.
+    field_fn : callable
+      Function (betti, sc) -> 1-D trajectory.
+    p_key : object
+      Key selecting the sub-edge-probability cell.
+
+    Returns
+    -------
+    ndarray
+      Mean trajectory interpolated onto q_common, length n_q (all
+      NaN if no iteration produced a valid trajectory).
+    """
     cell   = data[n_plot][k][p_key]
     n_iter = len(cell['Betti'])
     trajs  = []
@@ -3181,6 +5003,29 @@ def mean_term_traj(data, n_plot, n_q, k, q_common, field_fn, p_key):
     return np.nanmean(trajs, axis=0)
 
 def get_terminal_mean_nlba(data, n_plot, k, alpha_key, field_fn):
+    """
+    Computes the mean, across iterations, of a field's terminal
+    (final-timestep) value for one nonlinear-preferential-attachment
+    n/k/alpha combination.
+
+    Parameters
+    ----------
+    data : dict
+      Nested results dict indexed as data[n_plot][k][alpha_key].
+    n_plot : int
+      Node count to select.
+    k : int
+      Hyperedge size to select.
+    alpha_key : object
+      Key selecting the alpha (nonlinear PA exponent) cell.
+    field_fn : callable
+      Function (betti, sc, euler, cr, cr_b1) -> scalar terminal value.
+
+    Returns
+    -------
+    float
+      Mean terminal value across iterations (NaN if none are valid).
+    """
     vals = []
     d    = data[n_plot][k][alpha_key]
     n_it = len(d['Betti'])
@@ -3202,6 +5047,59 @@ def get_terminal_mean_nlba(data, n_plot, k, alpha_key, field_fn):
 
 def draw_nlba_figure(data, base_path, n_plot, k, k_colors, k_cmap, k_norm, n_k, K, alphas, alpha_keys, fields_nlba, panels, nrows, ncols, figsize,
                          suptitle, save_prefix, cbar_shrink=0.5):
+    """
+    Plots a grid of panels, each showing mean terminal field values vs.
+    nonlinear preferential-attachment exponent alpha, one line per
+    hyperedge size in K (colored), and saves the figure.
+
+    Parameters
+    ----------
+    data : dict
+      Nested results dict indexed as data[n_plot][k][alpha_key] (see
+      get_terminal_mean_nlba).
+    base_path : str
+      Directory to save the figure files to.
+    n_plot : int
+      Node count to select.
+    k : int
+      Placeholder loop variable name, overwritten per K value; not
+      otherwise used before being reassigned.
+    k_colors : dict
+      Maps each K value to a plot color.
+    k_cmap : Colormap
+      Colormap for the K colorbar.
+    k_norm : Normalize
+      Normalization for the K colorbar.
+    n_k : int
+      Number of discrete K values (colorbar tick count).
+    K : list of int
+      Hyperedge sizes to plot, one line per value.
+    alphas : list of float
+      Alpha values plotted on the x-axis.
+    alpha_keys : list
+      Keys selecting each alpha's results cell, aligned with alphas.
+    fields_nlba : dict
+      Maps each panel label to a field_fn (see get_terminal_mean_nlba).
+    panels : list of list of str
+      Grid of panel labels (keys into fields_nlba), row-major.
+    nrows : int
+      Number of subplot rows.
+    ncols : int
+      Number of subplot columns.
+    figsize : tuple of float
+      Figure size passed to plt.subplots.
+    suptitle : str
+      Figure title.
+    save_prefix : str
+      Filename prefix (without extension) for the saved figure.
+    cbar_shrink : float
+      Colorbar shrink factor.
+
+    Returns
+    -------
+    None
+      Displays the figure and saves it as PDF and PNG under base_path.
+    """
     fig, axes = plt.subplots(nrows, ncols, figsize=figsize,
                               constrained_layout=True)
     axes_flat = np.array(axes).flatten()
@@ -3237,6 +5135,30 @@ def draw_nlba_figure(data, base_path, n_plot, k, k_colors, k_cmap, k_norm, n_k, 
     print(f'Saved: {save_prefix}')
 
 def add_shared_cbar(fig, axes_list, n_p, p_cmap, p_norm, P_sorted):
+    """
+    Adds a single colorbar shared across multiple axes, labeled by
+    the proportion p of new nodes in each hyperedge (PA model ratio).
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+      Figure to attach the colorbar to.
+    axes_list : list of Axes
+      Axes the colorbar spans.
+    n_p : int
+      Number of discrete p values (tick count).
+    p_cmap : Colormap
+      Colormap used for the p values.
+    p_norm : Normalize
+      Normalization mapping p values to [0, 1].
+    P_sorted : list of float
+      p values, in tick order, used to build tick labels.
+
+    Returns
+    -------
+    cbar : matplotlib.colorbar.Colorbar
+      The created colorbar.
+    """
     sm = cm.ScalarMappable(cmap=p_cmap, norm=p_norm)
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=axes_list, shrink=0.95, pad=0.02,
@@ -3246,14 +5168,56 @@ def add_shared_cbar(fig, axes_list, n_p, p_cmap, p_norm, P_sorted):
     return cbar
 
 def analytical_ccdf(d_vals, p):
+    """
+    Computes the closed-form (analytical) complementary cumulative
+    distribution function (CCDF) of hyperdegree predicted for the PA
+    Poisson-Binomial hypergraph model at ratio p, using the Beta
+    function B(alpha+1, d+1) with alpha = 1/(1-p) (the model's
+    asymptotic power-law tail exponent, d^{-alpha}).
+
+    Parameters
+    ----------
+    d_vals : ndarray
+      Hyperdegree values to evaluate the CCDF at.
+    p : float
+      PA model ratio, p = E[X_t]/E[Y_t].
+
+    Returns
+    -------
+    ndarray
+      P(degree > d) for each d in d_vals.
+    """
     alpha  = 1.0 / (1.0 - p)
     log_cc = gammaln(alpha + 1) + gammaln(d_vals + 1) - gammaln(alpha + d_vals + 1)
     return np.exp(log_cc)
 
 def add_slope_line(ax, lam, P_PB_HG_c, P_PB_HG_bins, p_ref=0.45, x_anchor=10.0):
     """
-    Draw d^{-gamma} anchored so it passes through the p_ref data curve
-    at x = x_anchor.
+    Draws the reference power-law slope d^{-gamma}, with
+    gamma = 1/(1-p_ref) (the PA model's predicted CCDF exponent, see
+    analytical_ccdf), scaled so it passes through the empirical CCDF
+    curve for p_ref at x = x_anchor.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+      Axis to draw on.
+    lam : float
+      Poisson mean hyperedge size, used to key into P_PB_HG_c/bins.
+    P_PB_HG_c : dict
+      Maps (lam, p) -> empirical CCDF array.
+    P_PB_HG_bins : dict
+      Maps (lam, p) -> corresponding degree bin array.
+    p_ref : float
+      PA ratio whose empirical curve the slope line is anchored to.
+    x_anchor : float
+      Degree value at which the slope line matches the empirical curve.
+
+    Returns
+    -------
+    None
+      Draws the slope line and its annotation on ax; does nothing if
+      (lam, p_ref) is missing or x_anchor is outside the data range.
     """
     key = (lam, p_ref)
     if key not in P_PB_HG_c:
@@ -3290,6 +5254,32 @@ def add_slope_line(ax, lam, P_PB_HG_c, P_PB_HG_bins, p_ref=0.45, x_anchor=10.0):
     )
 
 def draw_panel(ax, lam, p_subset, p_colors, P_PB_HG_c, P_PB_HG_bins):
+    """
+    Plots empirical hyperdegree CCDF curves (solid) alongside their
+    analytical prediction (dashed, see analytical_ccdf) for a subset
+    of p values, on log-log axes.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+      Axis to draw on.
+    lam : float
+      Poisson mean hyperedge size, used to key into P_PB_HG_c/bins.
+    p_subset : iterable of float
+      PA ratio values to plot.
+    p_colors : dict
+      Maps each p value to a plot color.
+    P_PB_HG_c : dict
+      Maps (lam, p) -> empirical CCDF array.
+    P_PB_HG_bins : dict
+      Maps (lam, p) -> corresponding degree bin array.
+
+    Returns
+    -------
+    None
+      Draws onto ax and sets its axis scales/labels; skips any p in
+      p_subset missing from P_PB_HG_c.
+    """
     for p in p_subset:
         key = (lam, p)
         if key not in P_PB_HG_c:
@@ -3310,6 +5300,31 @@ def draw_panel(ax, lam, p_subset, p_colors, P_PB_HG_c, P_PB_HG_bins):
     ax.set_ylabel(r'$P(d_H > d)$')
 
 def violin(ax, x, values, color, width=0.35):
+    """
+    Draws a kernel-density-estimate "violin" (mirrored density curve)
+    of values at horizontal position x, with a diamond marker at the
+    mean. Falls back to a single diamond marker if there are too few
+    distinct values to estimate a density.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+      Axis to draw on.
+    x : float
+      Horizontal position of the violin.
+    values : iterable
+      Sample values (None entries are dropped).
+    color : str
+      Fill/line color.
+    width : float
+      Maximum half-width of the violin.
+
+    Returns
+    -------
+    None
+      Draws onto ax; does nothing if values is empty after dropping
+      None entries.
+    """
     values = [v for v in values if v is not None]
     if len(values) == 0:
         return

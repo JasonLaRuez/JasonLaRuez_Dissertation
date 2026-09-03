@@ -14,19 +14,17 @@ Date: 2026
 import networkx as nx # Network structures
 import numpy as np # Numpy arrays and operations
 import random # Random sampling for network models
-from itertools import combinations, product # For getting different simplices and all combinations of lists
+from itertools import combinations # For getting different simplices and all combinations of lists
 
 import matplotlib.lines as mlines
 import matplotlib.cm as cm
 import matplotlib.pyplot as plt # Plotting
 import time # Timing simulations
-from tqdm.notebook import trange, tqdm # Allows for real-time progress bar of simulations
+from tqdm.notebook import tqdm # Allows for real-time progress bar of simulations
 
 import gc # Memory management
 import pickle # Takes environment variables and saves them as is
 import gzip # Allows for compression of saved files
-from joblib import Parallel, delayed # Parallelization functions
-import multiprocessing # Get number of cpu cores
 
 import os # Iterating over directories for files
 import math 
@@ -44,10 +42,34 @@ import dionysus as d # C++ package with python bindings for persistent homology
 
 def ClusterCoeffUpdate(G,nodes,clusterC,clust_contrib,clust_sum,timer):
     """
-    Incremental average clustering
-    Adding edge (u,v) only affects the local clustering of u, v, and
-    their common neighbors. Recompute only those nodes using nx.clustering,
-    updating the running sum by subtracting old values and adding new ones.
+    Incrementally updates the running average clustering coefficient
+    after a graph change affecting the given nodes: since adding or
+    removing edges only affects the local clustering of the changed
+    nodes and their common neighbors, only those nodes are recomputed
+    (via nx.clustering) rather than the whole graph.
+
+    Parameters
+    ----------
+    G : networkx.Graph
+      The current graph, after the change has already been applied.
+    nodes : iterable
+      Nodes directly involved in the change (e.g. edge endpoints);
+      their neighbors are also recomputed.
+    clusterC : ndarray
+      Per-timestep average clustering coefficient time series;
+      clusterC[timer] is updated in place.
+    clust_contrib : dict
+      Maps each node to its current clustering coefficient
+      contribution; updated in place for affected nodes.
+    clust_sum : float
+      Running sum of all nodes' clustering coefficients.
+    timer : int
+      Current timestep index.
+
+    Returns
+    -------
+    float
+      The updated clust_sum.
     """
     affected = set(nodes)
     for u in nodes:
@@ -68,14 +90,36 @@ def ClusterCoeffUpdate(G,nodes,clusterC,clust_contrib,clust_sum,timer):
 
 def PH_ErdosRenyi(n, p = 1, timing = False, maxDim = np.inf):
   """
-  Input integer n = number of nodes in ER graph and terminal edge density
-  0 <= p <= 1. Iteratively adds  random edges to ER graph until the graph
-  is complete or until the added edge density surpasses p. Returns
-  the sets of the 0-th, 1-st, 2-nd and 3-rd betti numbers using
-  persistent homology (3-rd betti number is truncated betti number),
-  the counts of different dimensional simplices at each time step,
-  the set of Euler characteristics, the cycle rank at each time step,
-  and the average clustering coefficient at each time step.
+  Simulates an evolving Erdos-Renyi graph: starting from n isolated
+  nodes, every possible edge is added in a uniformly random order
+  (stopping once edge density p is reached), computing persistent
+  homology of the clique complex, cycle rank, and average clustering
+  coefficient as it grows.
+
+  Parameters
+  ----------
+  n : int
+    Number of nodes.
+  p : float
+    Terminal edge density (0 <= p <= 1) at which to stop adding edges.
+  timing : bool
+    Whether to display a progress bar.
+  maxDim : int or float
+    Maximum simplex dimension to track.
+
+  Returns
+  -------
+  Betti : ndarray, shape (4, timer+1)
+    Betti[k][t] is the k-th Betti number at timestep t (dim 3 is
+    truncated, since simplices above dim 3 are not tracked).
+  SimplexCounts : ndarray
+    Simplex counts by size at each timestep.
+  Euler : ndarray, shape (timer+1,)
+    Euler characteristic at each timestep.
+  cycleR : list, length timer+1
+    CR_1 (= N_1 - N_0 + beta_0) at each timestep.
+  clusterC : ndarray, length timer+1
+    Average clustering coefficient at each timestep.
   """
 
   if timing:
@@ -213,13 +257,37 @@ def PH_ErdosRenyi(n, p = 1, timing = False, maxDim = np.inf):
 
 def PH_BarabasiAlbert(n, k, timing = False, maxDim = np.inf):
   """
-  Input integer n = terminal number of nodes in BA graph, and
-  positive integer k which is the number of nodes that a newly added
-  node is connected to when it is added to the graph. Returns
-  the sets of the 0-th, 1-st, 2-nd and 3-rd betti numbers using
-  persistent homology (3-rd betti number is truncated betti number),
-  the counts of different dimensional simplices at each time step,
-  and the set of Euler characteristics.
+  Simulates an evolving Barabasi-Albert (linear preferential
+  attachment) graph: starting from a size-(k+1) star graph, each new
+  node connects to k existing nodes chosen with probability
+  proportional to degree, computing persistent homology of the
+  clique complex, cycle rank, and average clustering coefficient as
+  it grows to n nodes.
+
+  Parameters
+  ----------
+  n : int
+    Terminal number of nodes.
+  k : int
+    Number of edges a newly added node forms.
+  timing : bool
+    Whether to display a progress bar.
+  maxDim : int or float
+    Maximum simplex dimension to track.
+
+  Returns
+  -------
+  Betti : ndarray, shape (4, timer+1)
+    Betti[k][t] is the k-th Betti number at timestep t (dim 3 is
+    truncated, since simplices above dim 3 are not tracked).
+  SimplexCounts : list of list of int
+    Simplex counts by size at each timestep.
+  Euler : ndarray, shape (timer+1,)
+    Euler characteristic at each timestep.
+  cycleR : list, length timer+1
+    CR_1 (= N_1 - N_0 + beta_0) at each timestep.
+  clusterC : ndarray, length timer+1
+    Average clustering coefficient at each timestep.
   """
 
   if timing:
@@ -367,13 +435,36 @@ def PH_BarabasiAlbert(n, k, timing = False, maxDim = np.inf):
 
 def PH_RandomAttachment(n, k, timing = False, maxDim = np.inf):
   """
-  Input integer n = terminal number of nodes in graph, and
-  positive integer k which is the number of nodes that a newly added
-  node is connected to when it is added to the graph. Returns
-  the sets of the 0-th, 1-st, 2-nd and 3-rd betti numbers using
-  persistent homology (3-rd betti number is truncated betti number),
-  the counts of different dimensional simplices at each time step,
-  and the set of Euler characteristics.
+  Simulates an evolving random-attachment graph: starting from a
+  size-(k+1) star graph, each new node connects to k uniformly
+  randomly chosen existing nodes, computing persistent homology of
+  the clique complex, cycle rank, and average clustering coefficient
+  as it grows to n nodes.
+
+  Parameters
+  ----------
+  n : int
+    Terminal number of nodes.
+  k : int
+    Number of edges a newly added node forms.
+  timing : bool
+    Whether to display a progress bar.
+  maxDim : int or float
+    Maximum simplex dimension to track.
+
+  Returns
+  -------
+  Betti : ndarray, shape (4, timer+1)
+    Betti[k][t] is the k-th Betti number at timestep t (dim 3 is
+    truncated, since simplices above dim 3 are not tracked).
+  SimplexCounts : list of list of int
+    Simplex counts by size at each timestep.
+  Euler : ndarray, shape (timer+1,)
+    Euler characteristic at each timestep.
+  cycleR : list, length timer+1
+    CR_1 (= N_1 - N_0 + beta_0) at each timestep.
+  clusterC : ndarray, length timer+1
+    Average clustering coefficient at each timestep.
   """
 
   if timing:
@@ -431,7 +522,6 @@ def PH_RandomAttachment(n, k, timing = False, maxDim = np.inf):
 
     # Compute average clustering coefficient
     clust_sum = ClusterCoeffUpdate(G,targets+[v],clusterC,clust_contrib,clust_sum,timer)
-    print(nx.average_clustering(G), clusterC[timer])
 
     Cliques = nx.find_cliques(G,[v]) # <- Returns maximal cliques containing v
     for clique in Cliques:
@@ -511,13 +601,39 @@ def PH_RandomAttachment(n, k, timing = False, maxDim = np.inf):
 
 def ZZPH_WattsStrogatz(n, m, timing = False, maxDim = np.inf):
   """
-  Input integer n = number of nodes in WS graph, and
-  even integer m which is the degree of each node
-  in the initial ring lattice. Returns the sets of the
-  0-th, 1-st, 2-nd and 3-rd betti numbers using zigzag
-  persistent homology (3-rd betti number is truncated betti number),
-  the counts of different dimensional simplices at each time step,
-  and the set of Euler characteristics.
+  Simulates an evolving Watts-Strogatz graph: starting from a ring
+  lattice where each node connects to its m nearest neighbors, the
+  original lattice edges are rewired one at a time (in random order,
+  each moved to a new uniformly random endpoint), computing zigzag
+  persistent homology of the clique complex, average clustering
+  coefficient, and average shortest path length over the resulting
+  add/remove filtration.
+
+  Parameters
+  ----------
+  n : int
+    Number of nodes.
+  m : int
+    Degree of each node in the initial ring lattice (even).
+  timing : bool
+    Whether to display a progress bar.
+  maxDim : int or float
+    Maximum simplex dimension to track.
+
+  Returns
+  -------
+  Betti : ndarray, shape (4, timer+1)
+    Betti[k][t] is the k-th Betti number at timestep t (dim 3 is
+    truncated, since simplices above dim 3 are not tracked).
+  SimplexCounts : list of list of int
+    Simplex counts by size at each timestep.
+  Euler : ndarray, shape (timer+1,)
+    Euler characteristic at each timestep.
+  clusterC : ndarray, length timer+1
+    Average clustering coefficient at each timestep.
+  pathL : ndarray, length timer+1
+    Average shortest path length at each timestep (inf if the graph
+    is disconnected).
   """
 
   if timing:
@@ -700,14 +816,42 @@ def ZZPH_WattsStrogatz(n, m, timing = False, maxDim = np.inf):
 
 def PH_Nonlinear_BarabasiAlbert(n, k, alpha = 1.0, timing = False, maxDim = np.inf):
   """
-  Input integer n = terminal number of nodes in BA graph, and
-  positive integer k which is the number of nodes that a newly added
-  node is connected to when it is added to the graph. alpha is the
-  preferential strength parameter in nonlinear preferential attachment. 
-  Returns the sets of the 0-th, 1-st, 2-nd and 3-rd betti numbers using
-  persistent homology (3-rd betti number is truncated betti number),
-  the counts of different dimensional simplices at each time step,
-  and the set of Euler characteristics.
+  Simulates an evolving nonlinear-preferential-attachment graph: like
+  PH_BarabasiAlbert, but a node's attachment weight is its degree
+  raised to the power alpha (alpha=1 recovers linear preferential
+  attachment; alpha=0 recovers uniform/random attachment). Computes
+  persistent homology of the clique complex, cycle rank, and average
+  clustering coefficient as it grows to n nodes.
+
+  Parameters
+  ----------
+  n : int
+    Terminal number of nodes.
+  k : int
+    Number of edges a newly added node forms.
+  alpha : float
+    Nonlinear preferential-attachment exponent applied to node degree.
+  timing : bool
+    Whether to display a progress bar.
+  maxDim : int or float
+    Maximum simplex dimension to track.
+
+  Returns
+  -------
+  Betti : ndarray, shape (4, timer+1)
+    Betti[k][t] is the k-th Betti number at timestep t (dim 3 is
+    truncated, since simplices above dim 3 are not tracked).
+  SimplexCounts : list of list of int
+    Simplex counts by size at each timestep.
+  Euler : ndarray, shape (timer+1,)
+    Euler characteristic at each timestep.
+  D : collections.Counter
+    Degree frequency distribution: maps each observed degree to the
+    number of nodes with that degree.
+  cycleR : list, length timer+1
+    CR_1 (= N_1 - N_0 + beta_0) at each timestep.
+  clusterC : ndarray, length timer+1
+    Average clustering coefficient at each timestep.
   """
   if timing:
     print("(1/5) Initializing graph, variables and data structures",flush=True)
@@ -879,9 +1023,21 @@ def PH_Nonlinear_BarabasiAlbert(n, k, alpha = 1.0, timing = False, maxDim = np.i
 
 def ParallelCall_ER(params):
   """
-  Parallel function which is iteratively called,
-  looping over a set of parameters, with the current
-  iteration of parameters being params.
+  Worker function for parallel (joblib) sweeps of the Erdos-Renyi
+  graph model: runs PH_ErdosRenyi for one parameter combination and
+  pickles the result. Skips the run if its output file already exists.
+
+  Parameters
+  ----------
+  params : tuple
+    (n, p, iteration): node count, terminal edge density, run index.
+
+  Returns
+  -------
+  int
+    0 in all cases. Results ([Betti, SimplexCounts, Euler, cycleR,
+    clusterC]) are written to a filename derived from params rather
+    than returned directly.
   """
   n = params[0]; p = params[1]; iteration = params[2]
   filename = 'ErdosRenyi/ER_'+str(n)+'_'+str(p).replace('.','_')+'_'+str(iteration)+'.pkl'
@@ -899,9 +1055,22 @@ def ParallelCall_ER(params):
 
 def ParallelCall_BA(params):
   """
-  Parallel function which is iteratively called,
-  looping over a set of parameters, with the current
-  iteration of parameters being params.
+  Worker function for parallel (joblib) sweeps of the Barabasi-Albert
+  graph model: runs PH_BarabasiAlbert for one parameter combination
+  and pickles the result. Skips the run if its output file already
+  exists.
+
+  Parameters
+  ----------
+  params : tuple
+    (n, k, iteration): terminal node count, attachment count, run index.
+
+  Returns
+  -------
+  int
+    0 in all cases. Results ([Betti, SimplexCounts, Euler, cycleR,
+    clusterC]) are written to a filename derived from params rather
+    than returned directly.
   """
   n = params[0]; k = params[1]; iteration = params[2]
   filename = 'BarabasiAlbert/BA_'+str(n)+'_'+str(k)+'_'+str(iteration)+'.pkl'
@@ -915,9 +1084,22 @@ def ParallelCall_BA(params):
 
 def ParallelCall_RA(params):
   """
-  Parallel function which is iteratively called,
-  looping over a set of parameters, with the current
-  iteration of parameters being params.
+  Worker function for parallel (joblib) sweeps of the random-attachment
+  graph model: runs PH_RandomAttachment for one parameter combination
+  and pickles the result. Skips the run if its output file already
+  exists.
+
+  Parameters
+  ----------
+  params : tuple
+    (n, k, iteration): terminal node count, attachment count, run index.
+
+  Returns
+  -------
+  int
+    0 in all cases. Results ([Betti, SimplexCounts, Euler, cycleR,
+    clusterC]) are written to a filename derived from params rather
+    than returned directly.
   """
   n = params[0]; k = params[1]; iteration = params[2]
   filename = 'RandomAttachment/RA_'+str(n)+'_'+str(k)+'_'+str(iteration)+'.pkl'
@@ -931,9 +1113,22 @@ def ParallelCall_RA(params):
 
 def ParallelCall_WS(params):
   """
-  Parallel function which is iteratively called,
-  looping over a set of parameters, with the current
-  iteration of parameters being params.
+  Worker function for parallel (joblib) sweeps of the Watts-Strogatz
+  graph model: runs ZZPH_WattsStrogatz for one parameter combination
+  and pickles the result. Skips the run if its output file already
+  exists.
+
+  Parameters
+  ----------
+  params : tuple
+    (n, k, iteration): node count, ring-lattice degree, run index.
+
+  Returns
+  -------
+  int
+    0 in all cases. Results ([Betti, SimplexCounts, Euler, clusterC,
+    pathL]) are written to a filename derived from params rather than
+    returned directly.
   """
   n = params[0]; k = params[1]; iteration = params[2]
   filename = 'WattsStrogatz/WS_'+str(n)+'_'+str(k)+'_'+str(iteration)+'.pkl'
@@ -947,9 +1142,23 @@ def ParallelCall_WS(params):
 
 def ParallelCall_NLPA(params):
   """
-  Parallel function which is iteratively called,
-  looping over a set of parameters, with the current
-  iteration of parameters being params.
+  Worker function for parallel (joblib) sweeps of the nonlinear
+  preferential-attachment graph model: runs
+  PH_Nonlinear_BarabasiAlbert for one parameter combination and
+  pickles the result. Skips the run if its output file already exists.
+
+  Parameters
+  ----------
+  params : tuple
+    (n, k, alpha, iteration): terminal node count, attachment count,
+    nonlinear preferential-attachment exponent, and run index.
+
+  Returns
+  -------
+  int
+    0 in all cases. Results ([Betti, SimplexCounts, Euler, D,
+    cycleR, clusterC]) are written to a filename derived from params
+    rather than returned directly.
   """
   n = params[0]; k = params[1]; alpha = params[2]; iteration = params[3]
   filename = 'NLPA/NLPA_'+str(n)+'_'+str(k)+'_'+str(alpha).replace('.','_')+'_'+str(iteration)+'.pkl'
@@ -966,6 +1175,35 @@ def ParallelCall_NLPA(params):
 # ============================================================================
 
 def load_single_er(N, p, iteration, base_path):
+    """
+    Loads one gzip-pickled Erdos-Renyi result file (see
+    ParallelCall_ER), tolerating a missing or corrupted file.
+
+    Parameters
+    ----------
+    N : int
+      Node count used to locate the file.
+    p : float
+      Terminal edge density used to locate the file.
+    iteration : int
+      Run index used to locate the file.
+    base_path : str
+      Directory the file is located in.
+
+    Returns
+    -------
+    N : int
+      Echoed input node count.
+    p : float
+      Echoed input edge density.
+    iteration : int
+      Echoed input run index.
+    entry : list or None
+      The loaded [Betti, SimplexCounts, Euler, cycleR, clusterC]
+      result, or None on failure.
+    status : str
+      'ok', 'missing', or 'error: <exception message>'.
+    """
     filename = os.path.join(base_path,f'ER_{N}_{str(p).replace(".","_")}_{iteration}.pkl')
     if not os.path.isfile(filename):
         return N, p, iteration, None, 'missing'
@@ -977,6 +1215,36 @@ def load_single_er(N, p, iteration, base_path):
         return N, p, iteration, None, f'error: {e}'
 
 def load_single_ws(N, k, iteration, base_path):
+    """
+    Loads one pickled (not gzip-compressed, matching how
+    ParallelCall_WS saves it) Watts-Strogatz result file, tolerating
+    a missing or corrupted file.
+
+    Parameters
+    ----------
+    N : int
+      Node count used to locate the file.
+    k : int
+      Ring-lattice degree used to locate the file.
+    iteration : int
+      Run index used to locate the file.
+    base_path : str
+      Directory the file is located in.
+
+    Returns
+    -------
+    N : int
+      Echoed input node count.
+    k : int
+      Echoed input ring-lattice degree.
+    iteration : int
+      Echoed input run index.
+    entry : list or None
+      The loaded [Betti, SimplexCounts, Euler, clusterC, pathL]
+      result, or None on failure.
+    status : str
+      'ok', 'missing', or 'error: <exception message>'.
+    """
     filename = os.path.join(
         base_path,
         f'WS_{N}_{k}_{iteration}.pkl'
@@ -992,8 +1260,33 @@ def load_single_ws(N, k, iteration, base_path):
 
 def load_single_ba(N, k, iteration, base_path):
     """
-    Load a single file and return (k, iteration, data).
-    Returns None for the data field if file is missing or corrupted.
+    Loads one pickled (not gzip-compressed, matching how
+    ParallelCall_BA saves it) Barabasi-Albert result file, tolerating
+    a missing or corrupted file. Note: unlike load_single_er/ws, N is
+    not included in the return value.
+
+    Parameters
+    ----------
+    N : int
+      Node count used to locate the file (not returned).
+    k : int
+      Attachment count used to locate the file.
+    iteration : int
+      Run index used to locate the file.
+    base_path : str
+      Directory the file is located in.
+
+    Returns
+    -------
+    k : int
+      Echoed input attachment count.
+    iteration : int
+      Echoed input run index.
+    entry : list or None
+      The loaded [Betti, SimplexCounts, Euler, cycleR, clusterC]
+      result, or None on failure.
+    status : str
+      'ok', 'missing', or 'error: <exception message>'.
     """
     filename = os.path.join(base_path,f'BA_{N}_{k}_{iteration}.pkl')
     if not os.path.isfile(filename):
@@ -1006,6 +1299,35 @@ def load_single_ba(N, k, iteration, base_path):
         return k, iteration, None, f'error: {e}'
 
 def load_single_ra(N, k, iteration, base_path):
+    """
+    Loads one pickled (not gzip-compressed, matching how
+    ParallelCall_RA saves it) random-attachment result file,
+    tolerating a missing or corrupted file. Note: unlike
+    load_single_er/ws, N is not included in the return value.
+
+    Parameters
+    ----------
+    N : int
+      Node count used to locate the file (not returned).
+    k : int
+      Attachment count used to locate the file.
+    iteration : int
+      Run index used to locate the file.
+    base_path : str
+      Directory the file is located in.
+
+    Returns
+    -------
+    k : int
+      Echoed input attachment count.
+    iteration : int
+      Echoed input run index.
+    entry : list or None
+      The loaded [Betti, SimplexCounts, Euler, cycleR, clusterC]
+      result, or None on failure.
+    status : str
+      'ok', 'missing', or 'error: <exception message>'.
+    """
     filename = os.path.join(base_path,f'RA_{N}_{k}_{iteration}.pkl')
     if not os.path.isfile(filename):
         return k, iteration, None, 'missing'
@@ -1017,6 +1339,39 @@ def load_single_ra(N, k, iteration, base_path):
         return k, iteration, None, f'error: {e}'
 
 def load_single_nlpa(N, k, alpha, iteration, base_path):
+    """
+    Loads one pickled (not gzip-compressed, matching how
+    ParallelCall_NLPA saves it) nonlinear-preferential-attachment
+    result file, tolerating a missing or corrupted file. Note: unlike
+    load_single_er/ws, N is not included in the return value.
+
+    Parameters
+    ----------
+    N : int
+      Node count used to locate the file (not returned).
+    k : int
+      Attachment count used to locate the file.
+    alpha : float
+      Nonlinear preferential-attachment exponent used to locate the file.
+    iteration : int
+      Run index used to locate the file.
+    base_path : str
+      Directory the file is located in.
+
+    Returns
+    -------
+    k : int
+      Echoed input attachment count.
+    alpha : float
+      Echoed input exponent.
+    iteration : int
+      Echoed input run index.
+    entry : list or None
+      The loaded [Betti, SimplexCounts, Euler, D, cycleR, clusterC]
+      result, or None on failure.
+    status : str
+      'ok', 'missing', or 'error: <exception message>'.
+    """
     filename = os.path.join(
         base_path,
         f'NLPA_{N}_{k}_{str(alpha).replace(".","_")}_{iteration}.pkl'
@@ -1031,6 +1386,25 @@ def load_single_nlpa(N, k, alpha, iteration, base_path):
         return k, alpha, iteration, None, f'error: {e}'
 
 def sc_col(entry, dim):
+    """
+    Extracts one dimension's simplex-count time series from a loaded
+    ER/BA/RA/NLPA result entry's SimplexCounts field, which per
+    CLAUDE.md is a list of lists (possibly ragged across timesteps),
+    NOT a 2D numpy array.
+
+    Parameters
+    ----------
+    entry : list
+      A loaded result, indexed as entry[1] = SimplexCounts.
+    dim : int
+      Column index (simplex size - 1) to extract.
+
+    Returns
+    -------
+    ndarray
+      1-D array, one entry per timestep, with 0 where a row is too
+      short to have that column.
+    """
     sc = entry[1]
     return np.array([
         row[dim] if len(row) > dim else 0
@@ -1038,19 +1412,95 @@ def sc_col(entry, dim):
     ], dtype=float)
 
 def cR1(e):
-    """Stored cycleR = N1 - N0 + beta0"""
+    """
+    Extracts the stored CR_1 (= N_1 - N_0 + beta_0) time series from a
+    loaded ER/BA/RA result entry.
+
+    Parameters
+    ----------
+    e : list
+      A loaded result, indexed as e[3] = cycleR.
+
+    Returns
+    -------
+    ndarray
+      1-D array of CR_1 at each timestep.
+    """
     return np.array(e[3], dtype=float)
 
 def cR2(e):
+    """
+    Computes the CR_2 time series from a loaded ER/BA/RA result entry:
+    CR_2 = N_2 - CR_1 + beta_1.
+
+    Parameters
+    ----------
+    e : list
+      A loaded result, indexed as e[0] = Betti, e[1] = SimplexCounts.
+
+    Returns
+    -------
+    ndarray
+      1-D array of CR_2 at each timestep.
+    """
     return sc_col(e, 2) - cR1(e) + e[0][1].astype(float)
 
 def cR1_nlpa(e):
+    """
+    Extracts the stored CR_1 (= N_1 - N_0 + beta_0) time series from a
+    loaded NLPA result entry (whose fields are offset by one relative
+    to ER/BA/RA entries, due to the extra degree-distribution field D).
+
+    Parameters
+    ----------
+    e : list
+      A loaded NLPA result, indexed as e[4] = cycleR.
+
+    Returns
+    -------
+    ndarray
+      1-D array of CR_1 at each timestep.
+    """
     return np.array(e[4], dtype=float)
 
 def cR2_nlpa(e):
+    """
+    Computes the CR_2 time series from a loaded NLPA result entry:
+    CR_2 = N_2 - CR_1 + beta_1.
+
+    Parameters
+    ----------
+    e : list
+      A loaded NLPA result, indexed as e[0] = Betti, e[1] = SimplexCounts.
+
+    Returns
+    -------
+    ndarray
+      1-D array of CR_2 at each timestep.
+    """
     return sc_col(e, 2) - cR1_nlpa(e) + e[0][1].astype(float)
 
 def sc_col_ws(sc_list, dim):
+    """
+    Extracts one dimension's simplex-count time series from a
+    Watts-Strogatz result's SimplexCounts field (a list of lists,
+    per CLAUDE.md, possibly containing None rows).
+
+    Parameters
+    ----------
+    sc_list : list of list of float, or None
+      SimplexCounts time series; sc_list[t] is the row of simplex
+      counts by size at timestep t.
+    dim : int
+      Column index (simplex size - 1) to extract.
+
+    Returns
+    -------
+    ndarray
+      1-D array, one entry per timestep, with 0 where a row is
+      missing or too short to have that column; a length-1 zero
+      array if sc_list itself is None.
+    """
     if sc_list is None:
         return np.zeros(1)
     return np.array([
@@ -1059,17 +1509,68 @@ def sc_col_ws(sc_list, dim):
     ], dtype=float)
 
 def cR1_ws(e):
+    """
+    Computes the CR_1 (= N_1 - N_0 + beta_0) time series for a loaded
+    Watts-Strogatz result entry (which, unlike the ER/BA/RA/NLPA
+    models, does not store cycleR directly).
+
+    Parameters
+    ----------
+    e : list
+      A loaded WS result, indexed as e[0] = Betti, e[1] = SimplexCounts.
+
+    Returns
+    -------
+    ndarray
+      1-D array of CR_1 at each timestep.
+    """
     return (sc_col_ws(e[1], 1)
             - sc_col_ws(e[1], 0)
             + e[0][0].astype(float))
 
 def cR2_ws(e):
+    """
+    Computes the CR_2 time series for a loaded Watts-Strogatz result
+    entry: CR_2 = N_2 - CR_1 + beta_1.
+
+    Parameters
+    ----------
+    e : list
+      A loaded WS result, indexed as e[0] = Betti, e[1] = SimplexCounts.
+
+    Returns
+    -------
+    ndarray
+      1-D array of CR_2 at each timestep.
+    """
     return sc_col_ws(e[1], 2) - cR1_ws(e) + e[0][1].astype(float)
 
 def get_mean_traj_er(data, n, p, iterations, field_fn):
     """
-    Mean trajectory over iterations, x normalised to [0, p].
-    Returns (x_common, mean) or (None, None) if no data.
+    Computes the mean, across iterations, of a field's trajectory for
+    one Erdos-Renyi n/p combination, interpolated onto a common
+    x grid spanning [0, p].
+
+    Parameters
+    ----------
+    data : dict
+      Nested results dict indexed as data[n][p].
+    n : int
+      Node count to select.
+    p : float
+      Terminal edge density to select.
+    iterations : iterable
+      Run indices to average over.
+    field_fn : callable
+      Function (entry) -> 1-D trajectory, e.g. cR1 or cR2.
+
+    Returns
+    -------
+    x_common : ndarray or None
+      Common edge-density grid spanning [0, p], or None if no
+      iteration produced a valid trajectory.
+    mean : ndarray or None
+      Mean trajectory interpolated onto x_common, or None likewise.
     """
     trajs = []
     for iteration in iterations:
@@ -1091,6 +1592,31 @@ def get_mean_traj_er(data, n, p, iterations, field_fn):
     return x_common, interp.mean(axis=0)
 
 def add_discrete_cbar_er(fig, ax_target, n_cmap, n_norm, n_n, N, shrink=0.6):
+    """
+    Adds a discrete colorbar labeled by node count N to a figure.
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+      Figure to attach the colorbar to.
+    ax_target : Axes or array of Axes
+      Axes the colorbar is placed relative to.
+    n_cmap : Colormap
+      Colormap used for the N values.
+    n_norm : Normalize
+      Normalization mapping N values to [0, 1].
+    n_n : int
+      Number of discrete N values (tick count).
+    N : list
+      N values, in tick order, used as tick labels.
+    shrink : float
+      Colorbar shrink factor.
+
+    Returns
+    -------
+    cbar : matplotlib.colorbar.Colorbar
+      The created colorbar.
+    """
     sm = cm.ScalarMappable(cmap=n_cmap, norm=n_norm)
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=ax_target, shrink=shrink, pad=0.02,
@@ -1100,6 +1626,48 @@ def add_discrete_cbar_er(fig, ax_target, n_cmap, n_norm, n_n, N, shrink=0.6):
     return cbar
 
 def draw_er_figure(data_er, n_colors_all, NP_sorted, fields_er_pub, iterations, n_cmap_all, n_norm_all, n_k, N_unique, panel_layout, suptitle, base_path, save_prefix, shrink=0.5):
+    """
+    Plots a grid of panels, each showing mean field trajectories vs.
+    edge density for the Erdos-Renyi model, one line per (N, p)
+    combination (colored by N), and saves the figure.
+
+    Parameters
+    ----------
+    data_er : dict
+      Nested results dict indexed as data_er[n][p] (see get_mean_traj_er).
+    n_colors_all : dict
+      Maps each N value to a plot color.
+    NP_sorted : list of tuple
+      (n, p) combinations to plot, one line per pair.
+    fields_er_pub : dict
+      Maps each panel label to a field_fn (see get_mean_traj_er).
+    iterations : iterable
+      Run indices to average over.
+    n_cmap_all : Colormap
+      Colormap for the N colorbar.
+    n_norm_all : Normalize
+      Normalization for the N colorbar.
+    n_k : int
+      Number of discrete N values (colorbar tick count).
+    N_unique : list
+      N values, in tick order, for the colorbar.
+    panel_layout : list of tuple of str
+      Rows of (left_label, right_label) panel labels, keys into
+      fields_er_pub.
+    suptitle : str
+      Figure title.
+    base_path : str
+      Directory to save the figure files to.
+    save_prefix : str
+      Filename prefix (without extension) for the saved figure.
+    shrink : float
+      Colorbar shrink factor.
+
+    Returns
+    -------
+    None
+      Displays the figure and saves it as PDF and PNG under base_path.
+    """
     n_rows = len(panel_layout)
     fig, axes = plt.subplots(n_rows, 2,
                               figsize=(10, 3.5 * n_rows),
@@ -1129,15 +1697,27 @@ def draw_er_figure(data_er, n_colors_all, NP_sorted, fields_er_pub, iterations, 
     plt.show()
     print(f'Saved: {save_prefix}')
 
-def expected_Nk(n, k, p):
-    """Expected number of k-simplices (k-cliques) in G(n,p)."""
-    return comb(n, k) * p ** comb(k, 2)
-
 def expected_euler(n, p_arr):
     """
-    E[chi] = sum_{k=1}^{n} (-1)^{k-1} C(n,k) p^{C(k,2)}
-    Truncated at k=4 to match TDA computation (tetrahedra = max simplex).
-    Both full and truncated versions returned.
+    Computes the closed-form expected Euler characteristic of an
+    Erdos-Renyi G(n,p) clique complex: E[chi] = sum_{k=1}^{n}
+    (-1)^{k-1} C(n,k) p^{C(k,2)}, both in full and truncated at k=4
+    to match this module's TDA computation (tetrahedra = max simplex).
+
+    Parameters
+    ----------
+    n : int
+      Number of nodes.
+    p_arr : ndarray
+      Edge probabilities to evaluate at.
+
+    Returns
+    -------
+    chi_full : ndarray
+      Full expected Euler characteristic at each p in p_arr.
+    chi_trunc : ndarray
+      Expected Euler characteristic truncated to simplices of size
+      <= 4, at each p in p_arr.
     """
     chi_full  = np.zeros_like(p_arr)
     chi_trunc = np.zeros_like(p_arr)
@@ -1148,11 +1728,32 @@ def expected_euler(n, p_arr):
             chi_trunc += term
     return chi_full, chi_trunc
 
-def expected_simplex_counts(n, p_arr, max_k=4):
-    """Return E[N_k] for k = 1, ..., max_k."""
-    return {k: comb(n, k) * p_arr ** comb(k, 2) for k in range(1, max_k + 1)}
-
 def add_discrete_cbar_ws(fig, ax_target, k_cmap_ws, norm_ws, n_k_ws, K_ws_graph, shrink=0.6):
+    """
+    Adds a discrete colorbar labeled by ring-lattice degree k to a figure.
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+      Figure to attach the colorbar to.
+    ax_target : Axes or array of Axes
+      Axes the colorbar is placed relative to.
+    k_cmap_ws : Colormap
+      Colormap used for the k values.
+    norm_ws : Normalize
+      Normalization mapping k values to [0, 1].
+    n_k_ws : int
+      Number of discrete k values (tick count).
+    K_ws_graph : list
+      k values, in tick order, used as tick labels.
+    shrink : float
+      Colorbar shrink factor.
+
+    Returns
+    -------
+    cbar : matplotlib.colorbar.Colorbar
+      The created colorbar.
+    """
     sm = cm.ScalarMappable(cmap=k_cmap_ws, norm=norm_ws)
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=ax_target, shrink=shrink, pad=0.02,
@@ -1162,6 +1763,32 @@ def add_discrete_cbar_ws(fig, ax_target, k_cmap_ws, norm_ws, n_k_ws, K_ws_graph,
     return cbar
 
 def get_mean_traj_ws(data, n, k, iterations, field_fn):
+    """
+    Computes the mean, across iterations, of a field's trajectory for
+    one Watts-Strogatz n/k combination, interpolated onto a common
+    rewiring-probability grid spanning [0, 1].
+
+    Parameters
+    ----------
+    data : dict
+      Nested results dict indexed as data[n][k].
+    n : int
+      Node count to select.
+    k : int
+      Ring-lattice degree to select.
+    iterations : iterable
+      Run indices to average over.
+    field_fn : callable
+      Function (entry) -> 1-D trajectory, e.g. cR1_ws or cR2_ws.
+
+    Returns
+    -------
+    x_common : ndarray or None
+      Common rewiring-probability grid spanning [0, 1], or None if no
+      iteration produced a valid trajectory.
+    mean : ndarray or None
+      Mean trajectory interpolated onto x_common, or None likewise.
+    """
     trajs = []
     for iteration in iterations:
         entry = data[n][k].get(iteration, None)
@@ -1187,6 +1814,57 @@ def draw_ws_figure(data_ws_graph, fields_ws, n_plot, k_cmap_ws, norm_ws, n_k_ws,
                    k_colors_ws, k_ls_ws, iterations_ws_graph,
                    panel_layout, nrows, ncols, figsize,
                    suptitle, base_path, save_prefix, cbar_shrink=0.6):
+    """
+    Plots a grid of panels, each showing mean field trajectories vs.
+    rewiring probability for the Watts-Strogatz model, one line per
+    ring-lattice degree in K_ws_graph (colored and styled), and
+    saves the figure.
+
+    Parameters
+    ----------
+    data_ws_graph : dict
+      Nested results dict indexed as data_ws_graph[n_plot][k] (see
+      get_mean_traj_ws).
+    fields_ws : dict
+      Maps each panel label to a field_fn (see get_mean_traj_ws).
+    n_plot : int
+      Node count to select.
+    k_cmap_ws : Colormap
+      Colormap for the k colorbar.
+    norm_ws : Normalize
+      Normalization for the k colorbar.
+    n_k_ws : int
+      Number of discrete k values (colorbar tick count).
+    K_ws_graph : list of int
+      Ring-lattice degrees to plot, one line per value.
+    k_colors_ws : dict
+      Maps each k value to a plot color.
+    k_ls_ws : dict
+      Maps each k value to a linestyle.
+    iterations_ws_graph : iterable
+      Run indices to average over.
+    panel_layout : list of str
+      Panel labels (keys into fields_ws), in axes order.
+    nrows : int
+      Number of subplot rows.
+    ncols : int
+      Number of subplot columns.
+    figsize : tuple of float
+      Figure size passed to plt.subplots.
+    suptitle : str
+      Figure title.
+    base_path : str
+      Directory to save the figure files to.
+    save_prefix : str
+      Filename prefix (without extension) for the saved figure.
+    cbar_shrink : float
+      Colorbar shrink factor.
+
+    Returns
+    -------
+    None
+      Displays the figure and saves it as PDF and PNG under base_path.
+    """
     fig, axes = plt.subplots(nrows, ncols, figsize=figsize,
                              constrained_layout=True)
     axes_arr  = np.array(axes).flatten()
@@ -1218,6 +1896,32 @@ def draw_ws_figure(data_ws_graph, fields_ws, n_plot, k_cmap_ws, norm_ws, n_k_ws,
     print(f'Saved: {save_prefix}')
 
 def get_value_at_q(data_ws_scaling, iterations_ws_scaling, n, k, field_fn, q_target):
+    """
+    Computes the mean, across iterations, of a field's value at one
+    specific rewiring probability q_target, for one Watts-Strogatz
+    n/k combination (interpolating each iteration's trajectory onto
+    [0, 1] before sampling at q_target).
+
+    Parameters
+    ----------
+    data_ws_scaling : dict
+      Nested results dict indexed as data_ws_scaling[n][k].
+    iterations_ws_scaling : iterable
+      Run indices to average over.
+    n : int
+      Node count to select.
+    k : int
+      Ring-lattice degree to select.
+    field_fn : callable
+      Function (entry) -> 1-D trajectory.
+    q_target : float
+      Rewiring probability (in [0, 1]) to evaluate the field at.
+
+    Returns
+    -------
+    float
+      Mean value across iterations at q_target (NaN if none are valid).
+    """
     vals = []
     for iteration in iterations_ws_scaling:
         entry = data_ws_scaling[n][k].get(iteration, None)
@@ -1231,6 +1935,31 @@ def get_value_at_q(data_ws_scaling, iterations_ws_scaling, n, k, field_fn, q_tar
     return np.mean(vals) if vals else np.nan
 
 def add_discrete_colorbar_pa(fig, ax_target, k_cmap, norm, n_k, K, shrink = 0.6):
+    """
+    Adds a discrete colorbar labeled by attachment parameter k to a figure.
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+      Figure to attach the colorbar to.
+    ax_target : Axes or array of Axes
+      Axes the colorbar is placed relative to.
+    k_cmap : Colormap
+      Colormap used for the k values.
+    norm : Normalize
+      Normalization mapping k values to [0, 1].
+    n_k : int
+      Number of discrete k values (tick count).
+    K : list
+      k values, in tick order, used as tick labels.
+    shrink : float
+      Colorbar shrink factor.
+
+    Returns
+    -------
+    cbar : matplotlib.colorbar.Colorbar
+      The created colorbar.
+    """
     sm = cm.ScalarMappable(cmap=k_cmap, norm=norm)
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=ax_target, shrink=shrink, pad=0.02,
@@ -1241,6 +1970,27 @@ def add_discrete_colorbar_pa(fig, ax_target, k_cmap, norm, n_k, K, shrink = 0.6)
     return cbar
 
 def get_trajectories(data, k, iterations, field_fn):
+    """
+    Collects one field trajectory per iteration for a fixed k,
+    without averaging or interpolating.
+
+    Parameters
+    ----------
+    data : dict
+      Results dict indexed as data[k].
+    k : object
+      Key selecting the results cell (e.g. attachment parameter).
+    iterations : iterable
+      Run indices to collect trajectories for.
+    field_fn : callable
+      Function (entry) -> 1-D trajectory.
+
+    Returns
+    -------
+    trajs : list of ndarray
+      One trajectory per iteration that produced a valid (non-None)
+      result.
+    """
     trajs = []
     for iteration in iterations:
         entry = data[k].get(iteration, None)
@@ -1255,6 +2005,23 @@ def get_trajectories(data, k, iterations, field_fn):
     return trajs
 
 def mean_traj(trajs):
+    """
+    Computes the mean of a list of trajectories (see get_trajectories),
+    interpolated onto a common integer-step grid of length equal to
+    the longest trajectory.
+
+    Parameters
+    ----------
+    trajs : list of ndarray
+      Trajectories to average, of possibly differing lengths.
+
+    Returns
+    -------
+    x_common : ndarray or None
+      Common step grid (0, 1, ..., max_len-1), or None if trajs is empty.
+    mean : ndarray or None
+      Mean trajectory interpolated onto x_common, or None likewise.
+    """
     if not trajs:
         return None, None
     max_len  = max(len(t) for t in trajs)
@@ -1266,6 +2033,27 @@ def mean_traj(trajs):
     return x_common, interp.mean(axis=0)
 
 def get_terminals(field_fn, data_dict, k_list, iterations):
+    """
+    Collects each iteration's terminal (final-timestep) field value,
+    for each k in k_list.
+
+    Parameters
+    ----------
+    field_fn : callable
+      Function (entry) -> 1-D trajectory.
+    data_dict : dict
+      Results dict indexed as data_dict[k].
+    k_list : iterable
+      Keys (e.g. attachment parameters) to collect terminals for.
+    iterations : iterable
+      Run indices to collect terminal values for.
+
+    Returns
+    -------
+    terminals : dict
+      Maps each k in k_list to an ndarray of terminal values, one per
+      iteration that produced a valid, non-empty trajectory.
+    """
     terminals = {}
     for k in k_list:
         vals = []
@@ -1284,8 +2072,27 @@ def get_terminals(field_fn, data_dict, k_list, iterations):
 
 def clipped_yerr(means, stds, y_min=None, y_max=None):
     """
-    Compute asymmetric error bars clipped to [y_min, y_max].
-    Returns array of shape (2, n) for use as yerr in errorbar.
+    Computes asymmetric error bars, clipping the lower/upper extent so
+    means +/- error stays within [y_min, y_max].
+
+    Parameters
+    ----------
+    means : ndarray
+      Mean values at each point.
+    stds : ndarray
+      Standard deviations at each point (used as the unclipped error
+      bar length in both directions).
+    y_min : float or None
+      Lower clip bound; if None, the lower error bar is not clipped.
+    y_max : float or None
+      Upper clip bound; if None, the upper error bar is not clipped.
+
+    Returns
+    -------
+    ndarray, shape (2, n)
+      Row 0 is the (clipped) lower error bar length, row 1 the
+      (clipped) upper error bar length, for use as yerr in
+      Axes.errorbar.
     """
     lower = stds.copy()
     upper = stds.copy()
@@ -1298,6 +2105,45 @@ def clipped_yerr(means, stds, y_min=None, y_max=None):
 def plot_pa_ra(fields_pub, bounded_labels, data_ba, data_ra, K_shared, iterations,
                ba_color, ra_color, errbar_kw,
                ax, label, full_label = None):
+    """
+    Plots one field's terminal value vs. attachment parameter k, with
+    error bars, for the Barabasi-Albert (PA) and random-attachment
+    (RA) models overlaid on one axis.
+
+    Parameters
+    ----------
+    fields_pub : dict
+      Maps label to a field_fn (see get_terminals).
+    bounded_labels : container of str
+      Labels whose field is known to lie in [0, 1]; error bars for
+      these are clipped to that range.
+    data_ba : dict
+      Barabasi-Albert results dict indexed as data_ba[k].
+    data_ra : dict
+      Random-attachment results dict indexed as data_ra[k].
+    K_shared : list
+      Attachment parameter values to plot on the x-axis.
+    iterations : iterable
+      Run indices to average over.
+    ba_color : str
+      Line/marker color for the PA (BA) series.
+    ra_color : str
+      Line/marker color for the RA series.
+    errbar_kw : dict
+      Extra keyword arguments passed to Axes.errorbar.
+    ax : matplotlib.axes.Axes
+      Axis to draw on.
+    label : str
+      Key into fields_pub selecting the field to plot; also used as
+      the y-axis label unless full_label is given.
+    full_label : str or None
+      If given, used as the y-axis label instead of label.
+
+    Returns
+    -------
+    None
+      Draws onto ax and sets its labels/ticks.
+    """
     field_fn  = fields_pub[label]
     is_bounded = label in bounded_labels
     y_min      = 0.0 if is_bounded else None
@@ -1329,10 +2175,63 @@ def plot_pa_ra(fields_pub, bounded_labels, data_ba, data_ra, K_shared, iteration
     ax.set_xticks(K_shared)
 
 def get_mean_terminal(fields, fields_nlpa, iterations_graph, iterations_nlpa, k, alpha, label, data_nlpa, data_ra, data_ba):
+    """
+    Computes the mean terminal (final-timestep) field value for one
+    k/alpha combination, dispatching to the RA data (alpha=0), BA
+    data (alpha=1), or NLPA data (other alpha) as appropriate.
+
+    Parameters
+    ----------
+    fields : dict
+      Maps label to a field_fn for RA/BA entries (see get_terminals).
+    fields_nlpa : dict
+      Maps label to a field_fn for NLPA entries.
+    iterations_graph : iterable
+      Run indices to average over for RA/BA data.
+    iterations_nlpa : iterable
+      Run indices to average over for NLPA data.
+    k : object
+      Attachment parameter selecting the results cell.
+    alpha : float
+      Nonlinear preferential-attachment exponent; 0.0 selects RA
+      data, 1.0 selects BA data, otherwise NLPA data.
+    label : str
+      Key into fields/fields_nlpa selecting the field to evaluate.
+    data_nlpa : dict
+      NLPA results dict indexed as data_nlpa[k][alpha].
+    data_ra : dict
+      Random-attachment results dict indexed as data_ra[k].
+    data_ba : dict
+      Barabasi-Albert results dict indexed as data_ba[k].
+
+    Returns
+    -------
+    float
+      Mean terminal value across the selected iterations (NaN if none
+      are valid).
+    """
     field_fn = fields[label]
     field_fn_nlpa = fields_nlpa[label]
 
     def extract(data_dict, iters, fn):
+        """
+        Computes the mean terminal field value across iterations for
+        a single results dict (helper for the RA/BA branches above).
+
+        Parameters
+        ----------
+        data_dict : dict
+          Results dict indexed as data_dict[k].
+        iters : iterable
+          Run indices to average over.
+        fn : callable
+          Function (entry) -> 1-D trajectory.
+
+        Returns
+        -------
+        float
+          Mean terminal value across iterations (NaN if none are valid).
+        """
         vals = []
         for it in iters:
             entry = data_dict[k].get(it, None)
@@ -1362,6 +2261,55 @@ def draw_nlpa_figure(data_ba, data_ra, data_nlpa, fields, fields_nlpa, iteration
                       panels, nrows, ncols, figsize,
                      suptitle, base_path, save_prefix,
                      K_plot, k_styles, alphas_full):
+    """
+    Plots a grid of panels, each showing mean terminal field values vs.
+    nonlinear preferential-attachment exponent alpha (spanning RA at
+    alpha=0 through BA/PA at alpha=1, via get_mean_terminal), one line
+    per attachment parameter in K_plot (colored/styled), with RA and
+    PA reference lines annotated, and saves the figure.
+
+    Parameters
+    ----------
+    data_ba : dict
+      Barabasi-Albert results dict indexed as data_ba[k].
+    data_ra : dict
+      Random-attachment results dict indexed as data_ra[k].
+    data_nlpa : dict
+      NLPA results dict indexed as data_nlpa[k][alpha].
+    fields : dict
+      Maps panel label to a field_fn for RA/BA entries.
+    fields_nlpa : dict
+      Maps panel label to a field_fn for NLPA entries.
+    iterations_graph : iterable
+      Run indices to average over for RA/BA data.
+    iterations_nlpa : iterable
+      Run indices to average over for NLPA data.
+    panels : list of list of str
+      Grid of panel labels (keys into fields/fields_nlpa), row-major.
+    nrows : int
+      Number of subplot rows.
+    ncols : int
+      Number of subplot columns.
+    figsize : tuple of float
+      Figure size passed to plt.subplots.
+    suptitle : str
+      Figure title.
+    base_path : str
+      Directory to save the figure files to.
+    save_prefix : str
+      Filename prefix (without extension) for the saved figure.
+    K_plot : list
+      Attachment parameter values to plot, one line per value.
+    k_styles : dict
+      Maps each k in K_plot to a (color, marker, linestyle) tuple.
+    alphas_full : list of float
+      Alpha values plotted on the x-axis (must include 0.0 and 1.0).
+
+    Returns
+    -------
+    None
+      Displays the figure and saves it as PDF and PNG under base_path.
+    """
     fig, axes = plt.subplots(nrows, ncols, figsize=figsize,
                               constrained_layout=True)
     axes_flat = np.array(axes).flatten()
