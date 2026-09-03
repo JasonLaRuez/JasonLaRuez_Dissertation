@@ -13,20 +13,15 @@ Date: 2026
 import networkx as nx # Network structures
 import numpy as np # Numpy arrays and operations
 import random # Random sampling for network models
-from itertools import combinations, product # For getting different simplices and all combinations of lists
+from itertools import combinations # For getting different simplices and all combinations of lists
 
 import matplotlib.pyplot as plt # Plotting
-import time # Timing simulations
-from tqdm.notebook import trange, tqdm # Allows for real-time progress bar of simulations
+from tqdm.notebook import tqdm # Allows for real-time progress bar of simulations
 
-import gc # Memory management
-import pickle # Takes environment variables and saves them as is
-import gzip # Allows for compression of saved files
 from joblib import Parallel, delayed # Parallelization functions
 import multiprocessing # Get number of cpu cores
 
-import os # Iterating over directories for files
-import math 
+import math
 import seaborn as sns # Heatmap plots
 
 import dionysus as d # C++ package with python bindings for persistent homology
@@ -39,10 +34,26 @@ import dionysus as d # C++ package with python bindings for persistent homology
 
 def Windowing(width, layer, Edges):
     """
-    Given a sequence of edge sets, form windowings of these edge
-    sets where "width" is the initial width used in multilayer
-    ZZPH, and layer (0, 1, ...) is the layer in the lattice for which
-    the windowing is being constructed.
+    Aggregates a sequence of per-timestep edge sets into overlapping
+    time-windows for one layer of the multilayer zigzag lattice.
+
+    Parameters
+    ----------
+    width : int
+        Initial window width used in multilayer ZZPH.
+    layer : int
+        Layer index (0, 1, ...) in the lattice for which the
+        windowing is being constructed; higher layers union together
+        more neighboring windows.
+    Edges : list of set
+        Sequence of edge sets, one per timestep.
+
+    Returns
+    -------
+    W : list of set
+        One aggregated edge set per surviving window at this layer,
+        each the union of that window's base edge set with the
+        `layer` edge sets immediately following it.
     """
     # The i-th window in any layer always contains the i-th window from the 0-layer
     W = [edges.copy() for i, edges in enumerate(Edges) if i < int(len(Edges)/width) - layer]
@@ -55,16 +66,52 @@ def Windowing(width, layer, Edges):
     return W
 
 def remap(window_idx, width, layer, numWindows):
+    """
+    Rescales a window index at a given multilayer-lattice layer to
+    the normalized [0,1] time domain used by ZZPH to align
+    birth/death times across layers (see ZZPH).
+
+    Parameters
+    ----------
+    window_idx : int
+        Index of the window/event being remapped.
+    width : int
+        Initial window width used in multilayer ZZPH.
+    layer : int
+        Layer index (0, 1, ...) of the window being remapped.
+    numWindows : int
+        Normalization denominator; called with `len(Edges) + layer`.
+
+    Returns
+    -------
+    float
+        The remapped index, in [0,1] for valid inputs.
+    """
     return ( window_idx + (width / 2) * (layer + 1) ) / numWindows
 
 def ZZPH(Edges, width = None, layer = None):
     """
-    Given a sequence of edge sets, form a sequence of graphs,
-    then for each graph construct the corresponding clique complex.
-    Then, ZZPH is computed on this sequence of complexes and the 
-    resultant persistence diagrams are returned. If the width and
-    layer from MLZZPH is provided, then the scale of the diagrams are
-    remapped to [0,1].
+    Computes zigzag persistent homology on the clique complexes of a
+    sequence of graphs formed from windowed edge sets.
+
+    Parameters
+    ----------
+    Edges : list of set
+        Sequence of (windowed) edge sets; a graph and its clique
+        complex are formed from each.
+    width : int or None
+        Initial window width used in multilayer ZZPH. If provided
+        (along with `layer`), birth/death times are remapped to
+        [0,1] via `remap`.
+    layer : int or None
+        Layer index (0, 1, ...) in the multilayer lattice, used with
+        `width` to remap birth/death times to [0,1].
+
+    Returns
+    -------
+    dgms : list of dionysus Diagram
+        Persistence diagrams from the zigzag filtration, one per
+        homology dimension (dgms[0] = H0, dgms[1] = H1, etc.).
     """
     # Initialize T for times simplices are added and removed for ZZPH
     Times = dict()
@@ -134,13 +181,35 @@ def ZZPH(Edges, width = None, layer = None):
 
 def PeriodicRing(N, p_ER, max_p_WS, k_WS, period, steps):
     """
-    N = number of nodes
-    p_ER = constant probability of a non-ring edge being added
-    max_p_WS = maximum of the sinusoidal probability of including
-    an edge from the Watts-strogatz ring lattice
-    period = number of time steps for 1 sinusoidal period of the ring
-    lattice probabilities
-    steps = number of time steps to simulate
+    Simulates the toy periodic ring network: a Watts-Strogatz ring
+    lattice whose edges appear with a sinusoidally time-varying
+    probability, plus non-ring (Erdos-Renyi-style) edges appearing
+    with constant probability, over a number of discrete timesteps.
+
+    Parameters
+    ----------
+    N : int
+        Number of nodes.
+    p_ER : float
+        Constant probability of a non-ring edge being added at each
+        timestep.
+    max_p_WS : float
+        Maximum (peak) of the sinusoidal probability of including a
+        ring-lattice edge.
+    k_WS : int
+        Watts-Strogatz ring lattice degree parameter; each node is
+        connected to `k_WS` nearest neighbors in the base lattice.
+    period : int
+        Number of timesteps for one sinusoidal period of the ring
+        lattice edge probabilities.
+    steps : int
+        Number of timesteps to simulate.
+
+    Returns
+    -------
+    Edges : list of set
+        One edge set per simulated timestep, containing the ring and
+        non-ring edges present at that step.
     """
     # Initialize lists of lattice edges and non-lattice edges
     WS_edges = set(tuple(sorted([i,(i+j)%N])) for i in range(N) for j in range(1,int(k_WS / 2)+1))
@@ -164,26 +233,57 @@ def PeriodicRing(N, p_ER, max_p_WS, k_WS, period, steps):
     return Edges
 
 def compute_distance_matrices(layers, period, DGMs, p):
-    """ * Written using AI *
-    Computes D0 and D1 Wasserstein or Bottleneck distance matrices
-    between persistence diagrams for given layers and period.
+    """
+    Computes pairwise distance matrices between H0 and H1 persistence
+    diagrams across a set of layers, in parallel across CPU cores.
 
-    Parameters:
-    - layers: A range or list of layer indices.
-    - period: The current period being processed (used to access DGMs).
-    - DGMs: Dictionary containing persistence diagrams (DGMs[period][layer][dim]).
-    - p: String indicating the distance type ('1' for 1-Wasserstein, '2' for 2-Wasserstein, 'inf' for Bottleneck).
+    Parameters
+    ----------
+    layers : range or list of int
+        Layer indices to compare pairwise.
+    period : hashable
+        Key identifying the current period, used to index into DGMs.
+    DGMs : dict
+        Persistence diagrams, indexed as DGMs[period][layer][dim]
+        (dim 0 for H0, dim 1 for H1).
+    p : str
+        Distance type: '1' for 1-Wasserstein, '2' for 2-Wasserstein,
+        'inf' for Bottleneck distance.
 
-    Returns:
-    - d0: The computed distance matrix for dimension 0.
-    - d1: The computed distance matrix for dimension 1.
+    Returns
+    -------
+    d0 : ndarray, shape (len(layers), len(layers))
+        Symmetric H0 distance matrix between layers.
+    d1 : ndarray, shape (len(layers), len(layers))
+        Symmetric H1 distance matrix between layers.
     """
     n_layers = len(layers)
     d0 = np.zeros((n_layers, n_layers))
     d1 = np.zeros((n_layers, n_layers))
 
     def calculate_distances_for_chunk(chunk, period_data, p_type):
-        """Process a list of (i,j) pairs, returning a list of (i,j,dist0,dist1)."""
+        """
+        Computes H0 and H1 diagram distances for a chunk of layer
+        index pairs.
+
+        Parameters
+        ----------
+        chunk : list of tuple of int
+            (i, j) layer index pairs to process.
+        period_data : list
+            Per-layer persistence diagrams for the current period,
+            indexed as period_data[layer][dim].
+        p_type : str
+            Distance type: '1' for 1-Wasserstein, '2' for
+            2-Wasserstein, 'inf' for Bottleneck distance.
+
+        Returns
+        -------
+        results : list of tuple
+            One (i, j, dist0, dist1) tuple per input pair, where
+            dist0 is the H0 distance and dist1 the H1 distance
+            between layers i and j.
+        """
         results = []
         for i, j in chunk:
             dgm_i_0 = period_data[i][0]
@@ -228,6 +328,31 @@ def compute_distance_matrices(layers, period, DGMs, p):
     return d0, d1
 
 def plot_period_group_publication(period_group, D0, D1, p_max_WS, figsize=(10, 13), name = None):
+    """
+    Plots a grid of H0 and H1 Wasserstein-distance heatmaps, one row
+    per period, for a fixed p_max_WS.
+
+    Parameters
+    ----------
+    period_group : list
+        Period values to plot, one row each; used as keys into D0/D1.
+    D0 : dict
+        H0 distance matrices, indexed as D0[period]['1'].
+    D1 : dict
+        H1 distance matrices, indexed as D1[period]['1'].
+    p_max_WS : float
+        Fixed Watts-Strogatz peak edge probability, shown in the
+        figure title.
+    figsize : tuple of float
+        Figure size passed to plt.subplots.
+    name : str or None
+        If given, the figure is saved to this filename.
+
+    Returns
+    -------
+    None
+        Displays the figure; saves it to `name` if given.
+    """
     nrows = len(period_group)
 
     # Collect matrices so each homology column uses a fixed shared color scale
@@ -321,7 +446,10 @@ def plot_period_group_publication(period_group, D0, D1, p_max_WS, figsize=(10, 1
 def plot_persistence_diagram_publication(diagram, ax=None, title=None, point_size=42,
     point_color="#123B6D", diag_color="0.55", tick_fontsize=11, label_fontsize=13, title_fontsize=14):
     """
-    Plot a Dionysus persistence diagram in a publication-style format.
+    Plots a Dionysus persistence diagram (finite points only) in a
+    publication-style format, with a diagonal reference line and
+    axes fixed to [0,1].
+
     Parameters
     ----------
     diagram : dionysus diagram
@@ -336,6 +464,17 @@ def plot_persistence_diagram_publication(diagram, ax=None, title=None, point_siz
         Color of persistence points.
     diag_color : str
         Color of diagonal y=x line.
+    tick_fontsize : float
+        Font size of the axis tick labels.
+    label_fontsize : float
+        Font size of the axis labels.
+    title_fontsize : float
+        Font size of the subplot title.
+
+    Returns
+    -------
+    ax : matplotlib.axes.Axes
+        The axis the diagram was drawn on.
     """
 
     if ax is None:
@@ -386,6 +525,32 @@ def plot_persistence_diagram_publication(diagram, ax=None, title=None, point_siz
     return ax
 
 def plot_period_group_publication_pmax(p_group, D0, D1, period, figsize=(10, 13), name = None):
+    """
+    Plots a grid of H0 and H1 Wasserstein-distance heatmaps, one row
+    per p_max value, for a fixed period.
+
+    Parameters
+    ----------
+    p_group : list
+        Watts-Strogatz peak edge probability (p_max) values to plot,
+        one row each; used as keys into D0/D1.
+    D0 : dict
+        H0 distance matrices, indexed as D0[p]['1'].
+    D1 : dict
+        H1 distance matrices, indexed as D1[p]['1'].
+    period : int
+        Fixed ring-lattice sinusoid period, shown in the figure
+        title.
+    figsize : tuple of float
+        Figure size passed to plt.subplots.
+    name : str or None
+        If given, the figure is saved to this filename.
+
+    Returns
+    -------
+    None
+        Displays the figure; saves it to `name` if given.
+    """
     nrows = len(p_group)
 
     # Collect matrices so each homology column uses a fixed shared color scale
@@ -492,11 +657,36 @@ def plot_period_group_publication_pmax(p_group, D0, D1, period, figsize=(10, 13)
     plt.show()
 
 def plot_period_group_publication_prandom(p_group, D0, D1, period, figsize=(10, 13), name = None):
-    nrows = len(p_group)
+    """
+    Plots a grid of H0 and H1 Wasserstein-distance heatmaps, one row
+    per p_random (non-ring edge) value, for a fixed period. Unlike
+    plot_period_group_publication and
+    plot_period_group_publication_pmax, each row's heatmaps use their
+    own auto-scaled color range rather than one shared across rows.
 
-    # Collect matrices so each homology column uses a fixed shared color scale
-    all_d0 = [np.asarray(D0[p]['1']) for p in p_group]
-    all_d1 = [np.asarray(D1[p]['1']) for p in p_group]
+    Parameters
+    ----------
+    p_group : list
+        Non-ring (Erdos-Renyi-style) edge probability (p_random)
+        values to plot, one row each; used as keys into D0/D1.
+    D0 : dict
+        H0 distance matrices, indexed as D0[p]['1'].
+    D1 : dict
+        H1 distance matrices, indexed as D1[p]['1'].
+    period : int
+        Fixed ring-lattice sinusoid period, shown in the figure
+        title.
+    figsize : tuple of float
+        Figure size passed to plt.subplots.
+    name : str or None
+        If given, the figure is saved to this filename.
+
+    Returns
+    -------
+    None
+        Displays the figure; saves it to `name` if given.
+    """
+    nrows = len(p_group)
 
     # Figure + axes
     fig, ax = plt.subplots(
@@ -593,8 +783,3 @@ def plot_period_group_publication_prandom(p_group, D0, D1, period, figsize=(10, 
     if name:
         plt.savefig(name)
     plt.show()
-
-if __name__ == "__main__":
-    # This block only runs when the file is executed directly,
-    # not when it's imported as a module
-    main()
