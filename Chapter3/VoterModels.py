@@ -20,9 +20,10 @@ from itertools import combinations, product # For getting different simplices an
 
 from matplotlib.lines import Line2D
 from matplotlib import cm
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt # Plotting
 import time # Timing simulations
-from tqdm.notebook import trange, tqdm # Allows for real-time progress bar of simulations
+from tqdm.notebook import tqdm # Allows for real-time progress bar of simulations
 
 import sys
 from rbloom import Bloom
@@ -33,7 +34,6 @@ import gc # Memory management
 import pickle # Takes environment variables and saves them as is
 import gzip # Allows for compression of saved files
 from joblib import Parallel, delayed # Parallelization functions
-import multiprocessing # Get number of cpu cores
 import collections
 
 # ============================================================================
@@ -44,22 +44,34 @@ import collections
 
 def Get_Simpliciality_SF(filename, processed_filename = None, minDim = 2, maxDim = np.inf):
   """
-  Input: filename = string file name to load hypergraph
-         processed_filename = string file name to save data to
-         minDim = minimum simplex size to consider. Simplices below this
-                  dimension are disregarded. Simplices equal to this dimension
-                  are automatically downward closed and now counted.
-         maxDim = maximum simplex dimension to consider. Used to
-                  reduce computational complexity for large hypergraphs
-                  with high cardinality edges.
-  Return: SimplicialFraction = ratio of downward-closed hyperedges to
-                               the total number of hyperedges
-          Lengths = dictionary keeping track of the number of simplices of
-                    each dimension which are downward closed.
-  Description: To compute the simplicial fraction we take a dynamic
-  programming approach. We first sort the edges by ascending length.
-  Then, to check if a simplex e is downward closed it is sufficient to
-  check if its |e|-1 sized subsets belong to H and are downward closed.
+  Computes the simplicial fraction sigma_SF (proportion of hyperedges,
+  above minDim, that are downwardly closed) of a hypergraph, using a
+  dynamic-programming pass over edges sorted by ascending size: to
+  check if edge e is downward closed it is sufficient to check that
+  its |e|-1 sized subsets belong to H and are themselves downward
+  closed.
+
+  Parameters
+  ----------
+  filename : str or dict
+    Path to a gzip-pickled hypergraph dict {edge_id: nodes}, or the
+    hypergraph dict itself.
+  processed_filename : str or None
+    If given, path to save the computed output to (gzip-pickled).
+  minDim : int
+    Minimum edge size to consider. Edges below this size are
+    disregarded; edges equal to this size are automatically downward
+    closed and are not counted toward sigma_SF.
+  maxDim : int or float
+    Maximum edge size to consider, to bound computational cost for
+    hypergraphs with high-cardinality edges.
+
+  Returns
+  -------
+  Data : list
+    Data[0] : float, sigma_SF, the simplicial fraction.
+    Data[1] : collections.Counter, the number of downward-closed edges
+              of each size (restricted to minDim < size <= maxDim).
   """
   if type(filename) == dict:
     H = filename
@@ -134,6 +146,44 @@ def Get_Simpliciality_SF(filename, processed_filename = None, minDim = 2, maxDim
     return Data
 
 def Get_Simpliciality_ES(filename, processed_filename=None, maxMemory = 20, stoppingCriteria = None, minDim = 2, maxDim = np.inf):
+  """
+  Computes the edit simpliciality sigma_ES (distinct from sigma_SF
+  and sigma_FES) of a temporally-growing hypergraph at each
+  timestep: the number of edges present divided by the number of
+  edges present plus the number of missing sub-edges seen so far,
+  tracking previously-seen (present and missing) sub-edges with a
+  memory-bounded Bloom filter instead of an exact set. Optionally
+  stops early once the trajectory appears to have converged.
+
+  Parameters
+  ----------
+  filename : str or dict
+    Path to a gzip-pickled hypergraph dict {edge_id: nodes}, or the
+    hypergraph dict itself.
+  processed_filename : str or None
+    If given, path to save the computed output to (gzip-pickled).
+  maxMemory : float
+    Maximum memory, in GB, to allocate to the Bloom filter used to
+    track missing sub-edges.
+  stoppingCriteria : tuple of (int, float) or None
+    If given, (window, tol): every `window` timesteps, checks whether
+    sigma_ES over the last `window` steps has stayed within `tol` of
+    its final value in that window, and if so stops early.
+  minDim : int
+    Minimum edge size to consider; edges below this size are
+    disregarded.
+  maxDim : int or float
+    Maximum edge size to consider, to bound computational cost.
+
+  Returns
+  -------
+  float
+    sigma_ES at the final computed timestep (or, if stoppingCriteria
+    triggers early stopping, the timestep index t at which
+    convergence was detected is returned instead). The full
+    per-timestep trajectory is written to processed_filename if
+    given, rather than returned directly.
+  """
   # Load data from input filename
   if type(filename) == dict:
     H = filename
@@ -254,9 +304,22 @@ def Get_Simpliciality_ES(filename, processed_filename=None, maxMemory = 20, stop
 
 def ConstructCliqueComplex(G, k = float('inf')):
     """
-    Input a networkx graph G and output the clique simplicial
-    complex corresponding to G, where every node, edge and
-    clique (up to and including size k) is encoded as simplices.
+    Builds the clique simplicial complex of a networkx graph G, where
+    every node, edge, and clique (up to and including size k) is
+    encoded as a simplex.
+
+    Parameters
+    ----------
+    G : networkx.Graph
+      The graph to build the clique complex of.
+    k : int or float
+      Maximum clique size (number of nodes) to include.
+
+    Returns
+    -------
+    Complex : set of tuple
+      The clique complex, as a set of simplices (each a sorted tuple
+      of node ids).
     """
     # Find all maximal cliques in G which correspond to the maximal simplices
     Cliques = list(nx.find_cliques(G))
@@ -283,15 +346,42 @@ def ConstructCliqueComplex(G, k = float('inf')):
 
 def nFaces(Complex, n):
     """
-    Input a simplicial complex and integer n >= 0 and return all n-simplices (simplices with n+1 nodes)
+    Filters a simplicial complex down to its n-simplices (simplices
+    with n+1 nodes).
+
+    Parameters
+    ----------
+    Complex : iterable of tuple
+      A simplicial complex, as an iterable of simplices.
+    n : int
+      Simplex dimension to filter for (n >= 0).
+
+    Returns
+    -------
+    list of tuple
+      The simplices of Complex with exactly n+1 nodes.
     """
     # Filter function iterates through the faces of the complex and filters those with n+1 nodes
     return list(filter(lambda face: len(face) == n+1, Complex))
 
 def SimplexCounts(Complex):
     """
-    Input a simplical complex and return the counts of simplices of each dimension,
-    as well as the dimension of the complex (largest dimension of simplices).
+    Counts the number of simplices of each size in a simplicial
+    complex, and finds the complex's dimension.
+
+    Parameters
+    ----------
+    Complex : iterable of tuple
+      A simplicial complex, as an iterable of simplices.
+
+    Returns
+    -------
+    Counts : list of int
+      Counts[i] is the number of (i)-simplices (i.e. i+1 nodes);
+      Counts[0] is the vertex count.
+    Dim : int
+      The complex's dimension (the largest n with a nonempty n-simplex
+      count).
     """
     Counts = [len(nFaces(Complex, 0))]
     Dim = 0
@@ -306,9 +396,23 @@ def SimplexCounts(Complex):
 
 def ComputeResults(G, p = 2):
   """
-  Input a networkx graph G, and prime p to compute the betti
-  numbers of the clique complex of G over Z mod p. Return the
-  exact euler characteristic, as well as Betti numbers b0, b1, b2.
+  Computes the Euler characteristic and Betti numbers (b0, b1, b2) of
+  the clique complex of a graph (truncated to simplices of size <=
+  4), over Z mod p.
+
+  Parameters
+  ----------
+  G : networkx.Graph
+    The graph to compute results for.
+  p : int
+    Prime modulus for the homology coefficient field Z mod p.
+
+  Returns
+  -------
+  list
+    [b0, b1, b2, Euler, Counts], where b0/b1/b2 are the Betti numbers
+    (float), Euler is the Euler characteristic, and Counts is the
+    output of SimplexCounts(Complex)[0] (simplex counts by size).
   """
   Complex = ConstructCliqueComplex(G)
   Counts = SimplexCounts(Complex)[0]; Euler = 0
@@ -336,9 +440,24 @@ def ComputeResults(G, p = 2):
 
 def ComputeHGResults(H):
     """
-    Compute TDA quantities on the downward closure complex of hypergraph H.
-    H: dict of {edge_id: tuple/set of node ids}
-    Returns [b0, b1, b2, euler, counts] in the same format as ComputeResults.
+    Computes the Euler characteristic and Betti numbers (b0, b1, b2)
+    of the downward-closure complex of a hypergraph (not a clique
+    complex — hypergraph complexes are built by downward closure).
+
+    Parameters
+    ----------
+    H : dict
+      Hypergraph as {edge_id: nodes}, where nodes is an iterable of
+      node ids for that hyperedge.
+
+    Returns
+    -------
+    list
+      [b0, b1, b2, euler, counts] in the same format as
+      ComputeResults: b0/b1/b2 are the Betti numbers (int, counted as
+      infinite-persistence bars), euler is the Euler characteristic,
+      and counts is simplex counts by size (dims 0-3). Returns
+      [0, 0, 0, 0, [0, 0, 0, 0]] if H has no simplices.
     """
     # ── build downward closure ────────────────────────────────────────────────
     simplices = set()
@@ -385,7 +504,24 @@ def ComputeHGResults(H):
 # ============================================================================
 
 def remove_discordant(edge_id, DiscordantIndex, DiscordantEdges):
-    """O(1) removal from DiscordantEdges using swap-and-pop."""
+    """
+    Removes edge_id from the discordant-edge list in O(1), via
+    swap-and-pop.
+
+    Parameters
+    ----------
+    edge_id : hashable
+      Id of the edge to remove.
+    DiscordantIndex : dict
+      Maps each discordant edge id to its position in
+      DiscordantEdges; updated in place.
+    DiscordantEdges : list
+      List of discordant edge ids; updated in place.
+
+    Returns
+    -------
+    None
+    """
     pos = DiscordantIndex.pop(edge_id)
     last = DiscordantEdges[-1]
     DiscordantEdges[pos] = last
@@ -394,23 +530,85 @@ def remove_discordant(edge_id, DiscordantIndex, DiscordantEdges):
         DiscordantIndex[last] = pos
 
 def add_discordant(edge_id, DiscordantIndex, DiscordantEdges):
-    """O(1) addition to DiscordantEdges."""
+    """
+    Adds edge_id to the discordant-edge list in O(1).
+
+    Parameters
+    ----------
+    edge_id : hashable
+      Id of the edge to add.
+    DiscordantIndex : dict
+      Maps each discordant edge id to its position in
+      DiscordantEdges; updated in place.
+    DiscordantEdges : list
+      List of discordant edge ids; updated in place.
+
+    Returns
+    -------
+    None
+    """
     DiscordantIndex[edge_id] = len(DiscordantEdges)
     DiscordantEdges.append(edge_id)
 
 def has_disjoint_tuple(DiscordantEdges, E, source_neighbors, target_neighbors):
+    """
+    Checks whether any discordant edge is fully disjoint from both a
+    source and a target node's neighborhoods, i.e. is a valid
+    rewire-to-same target that shares no endpoint with either
+    neighborhood (used to detect when no valid rewiring partner
+    exists).
+
+    Parameters
+    ----------
+    DiscordantEdges : list
+      Discordant edge ids (indices into E) to search among.
+    E : list of tuple
+      Edge list; E[t] is the (u, v) node pair for edge id t.
+    source_neighbors : set
+      Neighbor node ids of the source node.
+    target_neighbors : set
+      Neighbor node ids of the target node.
+
+    Returns
+    -------
+    bool
+      True if at least one edge in DiscordantEdges has both endpoints
+      outside source_neighbors and target_neighbors.
+    """
     # "any" function stops as soon as a True is found
     return any((E[t][0] not in source_neighbors and E[t][0] not in target_neighbors) and (E[t][1] not in source_neighbors and E[t][1] not in target_neighbors) for t in DiscordantEdges)
 
 def G_RewireToRandomVoter(G, rho, alpha, exit_criteria = np.inf, timing = False):
     """
-    Input a networkx object G, initial opinion 0 density rho, and
-    rewiring probability alpha. Simulate the adaptive network voter
-    model on the input graph, where at each step a discordant edge
-    is selected uniformly. Then, with probability alpha the edge is rewired
-    at random, and with probability 1-alpha one node adopts the opinion
-    of its neighbor. Returns the proportions of opinions at each time step and
-    the terminal graph G.
+    Simulates the coevolving (adaptive network) voter model with
+    rewire-to-random on a graph: at each step a discordant edge is
+    selected uniformly; with probability alpha (per CLAUDE.md, the
+    probability of structural rewiring vs. social influence) its
+    source node is rewired to a uniformly random new neighbor,
+    otherwise the source node adopts its neighbor's opinion.
+
+    Parameters
+    ----------
+    G : networkx.Graph
+      Initial graph; modified in place and returned.
+    rho : float
+      Initial proportion of nodes with opinion 1.
+    alpha : float
+      Probability of structural rewiring vs. social influence.
+    exit_criteria : int or float
+      Maximum number of timesteps to simulate before stopping even if
+      discordant edges remain.
+    timing : bool
+      Whether to print progress information.
+
+    Returns
+    -------
+    Proportions : ndarray
+      Proportion of opinion-1 nodes at each timestep.
+    DiscordantCounts : ndarray
+      Proportion of discordant edges at each timestep.
+    G : networkx.Graph
+      The terminal graph.
     """
 
     if timing == True:
@@ -549,9 +747,26 @@ def G_RewireToRandomVoter(G, rho, alpha, exit_criteria = np.inf, timing = False)
 
 def PC_G_RewireRandom(params):
   """
-  Parallel function which is iteratively called,
-  looping over a set of parameters, with the current
-  iteration of parameters being params.
+  Worker function for parallel (joblib) sweeps of the graph
+  rewire-to-random voter model: builds an initial graph (Erdos-Renyi,
+  Barabasi-Albert, or Watts-Strogatz), runs G_RewireToRandomVoter for
+  one parameter combination, and pickles the result. Skips the run if
+  its output file already exists.
+
+  Parameters
+  ----------
+  params : tuple
+    (n, m, rho, alpha, iteration, graph): node count, edge count,
+    initial opinion-1 proportion, rewiring probability, run index,
+    and initial graph model ('ER', 'BA', or otherwise Watts-Strogatz
+    with rewiring probability 0).
+
+  Returns
+  -------
+  int
+    0 in all cases. Results ([Proportions, DiscordantCounts, G]) are
+    written to a filename derived from params rather than returned
+    directly.
   """
   # Grab parameter values from params list
   n = params[0]; m = params[1]; rho = params[2]; alpha = params[3]; iteration = params[4]; graph = params[5]
@@ -577,13 +792,37 @@ def PC_G_RewireRandom(params):
 
 def G_RewireToSameVoter(G, rho, alpha, exit_criteria = np.inf, timing = False):
     """
-    Input a networkx object G, initial opinion 0 density rho, and
-    rewiring probability alpha. Simulate the adaptive network voter
-    model on the input graph, where at each step a discordant edge
-    is selected uniformly. Then, with probability alpha the edge is rewired
-    to a node with the same opinion, and with probability 1-alpha one node adopts the opinion
-    of its neighbor. Returns the proportions of opinions at each time step and
-    the terminal graph G.
+    Simulates the coevolving (adaptive network) voter model with
+    rewire-to-same on a graph: at each step a discordant edge is
+    selected uniformly; with probability alpha (structural rewiring
+    vs. social influence) its source node is rewired to a new
+    neighbor sharing the source's opinion (drawn from another
+    discordant edge), otherwise the source node adopts its
+    neighbor's opinion. Returns early if alpha=1 and no valid
+    same-opinion rewiring partner exists.
+
+    Parameters
+    ----------
+    G : networkx.Graph
+      Initial graph; modified in place and returned.
+    rho : float
+      Initial proportion of nodes with opinion 1.
+    alpha : float
+      Probability of structural rewiring vs. social influence.
+    exit_criteria : int or float
+      Maximum number of timesteps to simulate before stopping even if
+      discordant edges remain.
+    timing : bool
+      Whether to print progress information.
+
+    Returns
+    -------
+    Proportions : ndarray
+      Proportion of opinion-1 nodes at each timestep.
+    DiscordantCounts : ndarray
+      Proportion of discordant edges at each timestep.
+    G : networkx.Graph
+      The terminal graph.
     """
 
     if timing == True:
@@ -730,9 +969,23 @@ def G_RewireToSameVoter(G, rho, alpha, exit_criteria = np.inf, timing = False):
 
 def PC_G_RewireSame(params):
   """
-  Parallel function which is iteratively called,
-  looping over a set of parameters, with the current
-  iteration of parameters being params.
+  Worker function for parallel (joblib) sweeps of the graph
+  rewire-to-same voter model: builds an Erdos-Renyi graph, runs
+  G_RewireToSameVoter for one parameter combination, and pickles the
+  result. Skips the run if its output file already exists.
+
+  Parameters
+  ----------
+  params : tuple
+    (n, m, rho, alpha, iteration): node count, edge count, initial
+    opinion-1 proportion, rewiring probability, and run index.
+
+  Returns
+  -------
+  int
+    0 in all cases. Results ([Proportions, DiscordantEdges, G]) are
+    written to a filename derived from params rather than returned
+    directly.
   """
   # Grab parameter values from params list
   n = params[0]; m = params[1]; rho = params[2]; alpha = params[3]; iteration = params[4];
@@ -752,13 +1005,41 @@ def PC_G_RewireSame(params):
 
 def G_TriangleRewireSameVoter(G, rho, alpha, gamma, exit_criteria = np.inf, timing = False):
     """
-    Input a networkx object G, initial opinion 0 density rho, and
-    rewiring probability alpha. Simulate the adaptive network voter
-    model on the input graph, where at each step a discordant edge
-    is selected uniformly. Then, with probability alpha the edge is rewired
-    at random, and with probability 1-alpha one node adopts the opinion
-    of its neighbor. Returns the proportions of opinions at each time step and
-    the terminal graph G.
+    Simulates the coevolving (adaptive network) voter model with
+    triangle-closing rewire-to-same on a graph: at each step a
+    discordant edge is selected uniformly; with probability alpha
+    (structural rewiring vs. social influence) the edge's source
+    node is rewired, and with probability gamma (triangle-closure
+    rewiring vs. plain rewire-to-same) the new neighbor is drawn from
+    the source's neighbors-of-neighbors (closing a triangle) rather
+    than from another discordant edge; otherwise (probability
+    1-alpha) the source node adopts its neighbor's opinion.
+
+    Parameters
+    ----------
+    G : networkx.Graph
+      Initial graph; modified in place and returned.
+    rho : float
+      Initial proportion of nodes with opinion 1.
+    alpha : float
+      Probability of structural rewiring vs. social influence.
+    gamma : float
+      Probability of triangle-closure rewiring vs. rewire-to-same,
+      given that structural rewiring occurs.
+    exit_criteria : int or float
+      Maximum number of timesteps to simulate before stopping even if
+      discordant edges remain.
+    timing : bool
+      Whether to print progress information.
+
+    Returns
+    -------
+    Proportions : ndarray
+      Proportion of opinion-1 nodes at each timestep.
+    DiscordantCounts : ndarray
+      Proportion of discordant edges at each timestep.
+    G : networkx.Graph
+      The terminal graph.
     """
 
     if timing == True:
@@ -955,9 +1236,25 @@ def G_TriangleRewireSameVoter(G, rho, alpha, gamma, exit_criteria = np.inf, timi
 
 def PC_G_RewireTriangleSame(params):
   """
-  Parallel function which is iteratively called,
-  looping over a set of parameters, with the current
-  iteration of parameters being params.
+  Worker function for parallel (joblib) sweeps of the graph
+  triangle-closing rewire-to-same voter model: builds an
+  Erdos-Renyi graph, runs G_TriangleRewireSameVoter for one
+  parameter combination, and pickles the result. Skips the run if
+  its output file already exists.
+
+  Parameters
+  ----------
+  params : tuple
+    (n, m, rho, alpha, gamma, iteration): node count, edge count,
+    initial opinion-1 proportion, rewiring probability, triangle-
+    closure probability, and run index.
+
+  Returns
+  -------
+  int
+    0 in all cases. Results ([Proportions, DiscordantCounts, G]) are
+    written to a filename derived from params rather than returned
+    directly.
   """
   # Grab parameter values from params list
   n = params[0]; m = params[1]; rho = params[2]; alpha = params[3]; gamma = params[4]; iteration = params[5];
@@ -980,86 +1277,78 @@ def PC_G_RewireTriangleSame(params):
 # ============================================================================
 
 def majority_vote(prop):
+    """
+    Applies majority-vote social influence: an edge's members all
+    adopt whichever opinion holds a strict majority, with a coin flip
+    to break exact ties.
+
+    Parameters
+    ----------
+    prop : float
+      Proportion of an edge's members currently holding opinion 1.
+
+    Returns
+    -------
+    int
+      1 or 0, the opinion the edge converges to.
+    """
     return 1 if prop > 0.5 else (0 if prop < 0.5 else np.random.randint(2))
 
 def proportional_vote(prop):
+    """
+    Applies proportional-vote social influence: an edge's members
+    adopt opinion 1 with probability equal to the current proportion
+    of members holding opinion 1 (and opinion 0 otherwise).
+
+    Parameters
+    ----------
+    prop : float
+      Proportion of an edge's members currently holding opinion 1.
+
+    Returns
+    -------
+    int
+      1 or 0, the opinion the edge converges to.
+    """
     return 1 if random.random() < prop else 0
-
-def rewire_random(H, E, N, Opinions, Count, DiscordantIndex, DiscordantEdges, edge_id, edgeChoice):
-    """
-    Performs random rewiring by swapping nodes between edges.
-
-    Input: H: Hypergraph dict
-           E: List of edge ids
-           N: Node neighborhood dict
-           Opinions: Node opinion dict
-           Prop: Edge proportion dict
-           DiscordantEdges: List of discordant edges
-           edge_id: Selected edge to rewire
-           edgeChoice: Index of edge in DiscordantEdges
-    Output: Updated data structures
-    """
-    # Select source node
-    sourceEdge = H[edge_id]
-    sourceNode_id = np.random.randint(len(sourceEdge))
-    sourceNode = sourceEdge[sourceNode_id]
-
-    while True:
-        # Select random edge and check if valid
-        targetEdge_id = random.choice(E)
-        if targetEdge_id != edge_id:
-            # Randomly select target node
-            targetEdge = H[targetEdge_id]
-            targetNode_id = np.random.randint(len(targetEdge))
-            targetNode = targetEdge[targetNode_id]
-            if (targetNode != sourceNode) and (sourceNode not in targetEdge) and (targetNode not in sourceEdge):
-                break
-
-    # Update original edge
-    sourceEdge[sourceNode_id] = targetNode
-    sourceEdge = sorted(sourceEdge)
-    H[edge_id] = sourceEdge
-
-    # Subtract contribution of source node and add contribution of target node
-    Count[edge_id] = Count[edge_id] + Opinions[targetNode] - Opinions[sourceNode]
-
-    if Count[edge_id] == 0 or Count[edge_id] == len(H[edge_id]):
-        # Edge is now in consensus, remove from DiscordantEdges
-        remove_discordant(edge_id, DiscordantIndex, DiscordantEdges)
-
-    # Update targeted edge
-    count = Count[targetEdge_id]
-    targetEdge[targetNode_id] = sourceNode
-    targetEdge = sorted(targetEdge)
-    H[targetEdge_id] = targetEdge
-    Count[targetEdge_id] = Count[targetEdge_id] + Opinions[sourceNode] - Opinions[targetNode]
-
-    # Update DiscordantEdges for target edge
-    if (count == 0 or count == len(targetEdge)) and (Count[targetEdge_id] != 0 and Count[targetEdge_id] != len(targetEdge)):
-        add_discordant(targetEdge_id, DiscordantIndex, DiscordantEdges)
-    elif (count != 0 and count != len(targetEdge)) and (Count[targetEdge_id] == 0 or Count[targetEdge_id] == len(targetEdge)):
-        remove_discordant(targetEdge_id, DiscordantIndex, DiscordantEdges)
-
-    # Update neighborhood of nodes
-    N[sourceNode].remove(edge_id)
-    N[sourceNode].add(targetEdge_id)
-    N[targetNode].add(edge_id)
-    N[targetNode].remove(targetEdge_id)
-
 
 def social_influence(H, N, Opinions, Count, DiscordantIndex, DiscordantEdges, edge_id, edgeChoice, vote_function):
     """
-    Performs social influence step where nodes adopt opinions based on voting rule.
+    Performs a social-influence step on hyperedge edge_id: applies
+    vote_function to determine the edge's converged opinion, updates
+    member node opinions accordingly, and updates DiscordantEdges for
+    edge_id and any neighboring edges affected by the opinion changes.
 
-    Input: H: Hypergraph dict
-           N: Node neighborhood dict
-           Opinions: Node opinion dict
-           Prop: Edge proportion dict
-           DiscordantEdges: List of discordant edges
-           edge_id: Selected edge for influence
-           edgeChoice: Index of edge in DiscordantEdges
-           voting: Voting rule ('Majority' or 'Proportional')
-    Output: Number of nodes that changed opinion and their new opinion
+    Parameters
+    ----------
+    H : dict
+      Hypergraph as {edge_id: nodes}.
+    N : dict
+      Maps each node to the set of edge ids it belongs to.
+    Opinions : dict
+      Maps each node to its current opinion (0 or 1); updated in place.
+    Count : dict
+      Maps each edge id to its count of opinion-1 members; updated in
+      place.
+    DiscordantIndex : dict
+      Maps each discordant edge id to its position in
+      DiscordantEdges; updated in place.
+    DiscordantEdges : list
+      List of discordant edge ids; updated in place.
+    edge_id : hashable
+      The edge undergoing social influence.
+    edgeChoice : int
+      Index of edge_id in DiscordantEdges (unused directly, accepted
+      for signature symmetry).
+    vote_function : callable
+      Voting rule, e.g. majority_vote or proportional_vote.
+
+    Returns
+    -------
+    changed_count : int
+      Number of nodes whose opinion changed.
+    Majority : int
+      The opinion (0 or 1) the edge converged to.
     """
     edge = H[edge_id]
     # Determine majority class based on voting rule
@@ -1106,114 +1395,46 @@ def social_influence(H, N, Opinions, Count, DiscordantIndex, DiscordantEdges, ed
     return len(changed), Majority
 
 
-def HG_RewireRandom_Voter(H, alpha, rho, voting='Majority', exit_criteria = np.inf, timing=False):
-    """
-    Implementation of the hypergraph rewire-to-random model using
-    a node-swapping rewiring rule.
-    Input: Initial hypergraph dict H = {edge_id: edge_list}
-           alpha: Probability of rewiring
-           rho: Initial proportion of opinion 1 in H
-           voting: Rule used for voting, either 'Majority' or 'Proportional'
-           timing: Whether to print timing information
-    Output: List of proportions of opinion 1 at each time step, and
-            terminal hypergraph H.
-    """
-
-    vote_function = majority_vote if voting == 'Majority' else proportional_vote
-
-    if timing:
-        print("Initializing hypergraph, variables and data structures", flush=True)
-        start = time.time()
-
-    # Get node list by taking set union of edges
-    V = set(v for e in H for v in H[e])
-    # Store edge id list for random selection
-    E = list(H.keys())
-    # Create incidence dict to know what edges are incident to each node
-    N = {v: set() for v in V}
-    for e in H:
-        for v in H[e]:
-            N[v].add(e)
-
-    # Set |V|*rho many nodes to opinion 1 and the rest to opinion 0
-    Opinions = set(np.random.choice(list(V), size=round(rho*len(V)), replace=False))
-    Opinions = {v: 1 if v in Opinions else 0 for v in V}
-
-    # For each edge compute the proportion of member nodes with opinion 1
-    Count = {e: sum(Opinions[v] for v in H[e]) for e in H}
-
-    # Generate list of all edges where connected nodes have differing opinions
-    DiscordantEdges = [e for e in H if Count[e] > 0 and Count[e] < len(H[e])]
-    DiscordantIndex = {edge_id: pos for pos, edge_id in enumerate(DiscordantEdges)}
-
-    # Initialize list of opinion proportions
-    Proportions = [sum(Opinions.values()) / len(V)]
-    DiscordantCounts = [len(DiscordantEdges) / len(E)]
-    timer = 0
-
-    if timing:
-        end = time.time()
-        print("Initialization complete, time taken: " + str(end - start) + " seconds", flush=True)
-        print("Beginning network evolution", flush=True)
-        start = time.time()
-
-    while len(DiscordantEdges) > 0 and timer < exit_criteria:
-        # Copy proportions from previous time step, and update timer
-        timer += 1
-        Proportions.append(Proportions[-1])
-
-        # Uniformly select a discordant edge
-        edgeChoice = np.random.randint(len(DiscordantEdges))
-        edge_id = DiscordantEdges[edgeChoice]
-
-        # Random Rewiring (probability alpha)
-        if random.random() < alpha:
-            rewire_random(H, E, N, Opinions, Count, DiscordantIndex, DiscordantEdges, edge_id, edgeChoice)
-
-        # Social influence (probability 1-alpha)
-        else:
-            num_changed, new_opinion = social_influence(H, N, Opinions, Count,
-                                                        DiscordantIndex, DiscordantEdges, edge_id,
-                                                        edgeChoice, vote_function)
-
-            # Update global proportion
-            if new_opinion == 1:
-                Proportions[timer] += num_changed / len(V)
-            else:
-                Proportions[timer] -= num_changed / len(V)
-
-        DiscordantCounts.append(len(DiscordantEdges) / len(E))
-
-    if timing:
-        end = time.time()
-        print("Evolution complete, time taken: " + str(end - start) + " seconds", flush=True)
-
-    return np.array(Proportions), np.array(DiscordantCounts), H
-
-def PC_HG_RewireRandom(params):
-  """
-  Parallel function which is iteratively called,
-  looping over a set of parameters, with the current
-  iteration of parameters being params.
-  """
-  # Grab parameter values from params list
-  n = params[0]; m = params[1]; rho = params[2]; alpha = params[3]; voting = params[4]; iteration = params[5];
-  # Create filename from params
-  filename =  'Voter/Triangle/G_rewire_triangle_'+str(n)+'_'+str(m)+'_'+str(rho).replace('.','_')+'_'+str(alpha).replace('.','_')+'_'+voting+'_'+str(iteration)+'.pkl'
-  if os.path.isfile(filename):
-    return 0
-
-  G = nx.gnm_random_graph(n,m)
-  Proportions, DiscordantCounts, H = HG_RewireRandom_Voter(H, alpha, rho, voting=voting)
-  data = [Proportions, DiscordantCounts, H]
-
-  # Pickle and save the output
-  with gzip.open(filename,'wb') as f:
-    pickle.dump(data, f);
-  return 0
-
 def HG_RewireSame_Voter(H, alpha, rho, voting='Majority',
                          exit_criteria=np.inf, timing=False):
+    """
+    Simulates the coevolving (adaptive network) voter model with
+    rewire-to-same on a hypergraph: at each step a discordant
+    hyperedge is selected uniformly; with probability alpha
+    (structural rewiring vs. social influence) a minority-opinion
+    node in the edge is swapped with an opposite-majority node from
+    another edge (rewire-to-same, preserving each edge's size),
+    otherwise social influence is applied via vote_function
+    (majority_vote or proportional_vote, selected by voting).
+    Maintains an O(1) stratified discordant-edge structure (by
+    majority opinion) to sample valid rewiring partners efficiently.
+
+    Parameters
+    ----------
+    H : dict
+      Initial hypergraph as {edge_id: nodes}; modified in place and
+      returned.
+    alpha : float
+      Probability of structural rewiring vs. social influence.
+    rho : float
+      Initial proportion of nodes with opinion 1.
+    voting : str
+      Voting rule for social influence: 'Majority' or 'Proportional'.
+    exit_criteria : int or float
+      Maximum number of timesteps to simulate before stopping even if
+      discordant edges remain.
+    timing : bool
+      Whether to print progress information.
+
+    Returns
+    -------
+    Proportions : ndarray
+      Proportion of opinion-1 nodes at each timestep.
+    DiscordantCounts : ndarray
+      Proportion of discordant edges at each timestep.
+    H : dict
+      The terminal hypergraph.
+    """
 
     vote_function = majority_vote if voting == 'Majority' else proportional_vote
 
@@ -1478,17 +1699,48 @@ def HG_RewireSame_Voter(H, alpha, rho, voting='Majority',
 def HG_RewireTriangleSame_Voter(H, alpha, rho, gamma, voting='Majority',
                                   exit_criteria=np.inf, timing=False):
     """
-    Hypergraph voter model combining structure-aware transitivity enforcement
-    with opinion-aware rewire-to-same as fallback.
+    Simulates the coevolving (adaptive network) voter model on a
+    hypergraph, combining structure-aware transitivity enforcement
+    with opinion-aware rewire-to-same as a fallback. With probability
+    alpha (structural rewiring vs. social influence), rewiring
+    occurs: with probability gamma (triangle-closure rewiring vs.
+    rewire-to-same), a triangle-closing swap is attempted, selecting
+    nodes purely on structural grounds (no opinion filtering), falling
+    back to rewire-to-same if no valid triangle swap exists; with
+    probability 1-gamma (or on triangle failure), rewire-to-same is
+    used instead, swapping minority-opinion nodes between edges of
+    opposite majority to drive consensus. With probability 1-alpha,
+    social influence is applied via vote_function (majority_vote or
+    proportional_vote, selected by voting).
 
-    With probability alpha, rewiring occurs:
-      - With probability gamma: a triangle-closing swap is attempted,
-        selecting nodes purely on structural grounds (no opinion filtering).
-        If no valid triangle swap exists, falls back to rewire-to-same.
-      - With probability 1-gamma (or on triangle failure): rewire-to-same
-        is used, swapping minority-opinion nodes between edges of opposite
-        majority to drive consensus.
-    With probability 1-alpha, social influence is applied.
+    Parameters
+    ----------
+    H : dict
+      Initial hypergraph as {edge_id: nodes}; modified in place and
+      returned.
+    alpha : float
+      Probability of structural rewiring vs. social influence.
+    rho : float
+      Initial proportion of nodes with opinion 1.
+    gamma : float
+      Probability of triangle-closure rewiring vs. rewire-to-same,
+      given that structural rewiring occurs.
+    voting : str
+      Voting rule for social influence: 'Majority' or 'Proportional'.
+    exit_criteria : int or float
+      Maximum number of timesteps to simulate before stopping even if
+      discordant edges remain.
+    timing : bool
+      Whether to print progress information.
+
+    Returns
+    -------
+    Proportions : ndarray
+      Proportion of opinion-1 nodes at each timestep.
+    DiscordantCounts : ndarray
+      Proportion of discordant edges at each timestep.
+    H : dict
+      The terminal hypergraph.
     """
     vote_function = majority_vote if voting == 'Majority' else proportional_vote
 
@@ -1818,9 +2070,26 @@ def HG_RewireTriangleSame_Voter(H, alpha, rho, gamma, voting='Majority',
 
 def PC_HG_RewireTriangleSame(params):
   """
-  Parallel function which is iteratively called,
-  looping over a set of parameters, with the current
-  iteration of parameters being params.
+  Worker function for parallel (joblib) sweeps of the hypergraph
+  triangle-closing rewire-to-same voter model: builds a k-uniform ER
+  hypergraph, runs HG_RewireTriangleSame_Voter for one parameter
+  combination, and pickles the result. Skips the run if its output
+  file already exists.
+
+  Parameters
+  ----------
+  params : tuple
+    (n, m, k, rho, alpha, gamma, voting, iteration): node count,
+    hyperedge count, hyperedge size, initial opinion-1 proportion,
+    rewiring probability, triangle-closure probability, voting rule,
+    and run index.
+
+  Returns
+  -------
+  int
+    0 in all cases. Results ([Proportions, DiscordantCounts, H]) are
+    written to a filename derived from params rather than returned
+    directly.
   """
   # Grab parameter values from params list
   n = params[0]; m = params[1]; k = params[2]; rho = params[3]; alpha = params[4]; gamma = params[5]; voting = params[6]; iteration = params[7];
@@ -1845,7 +2114,7 @@ def PC_HG_RewireTriangleSame(params):
   for e in H_ER:
     H_ER[e] = list(H_ER[e])
 
-  Proportions, DiscordantCounts, H = HG_RewireTriangleSame_Voter(H, alpha, rho, gamma, voting=voting)
+  Proportions, DiscordantCounts, H = HG_RewireTriangleSame_Voter(H_ER, alpha, rho, gamma, voting=voting)
   data = [Proportions, DiscordantCounts, H]
 
   # Pickle and save the output
@@ -1855,9 +2124,34 @@ def PC_HG_RewireTriangleSame(params):
 
 def PC_Simplicial_WS(params):
   """
-  Parallel function which is iteratively called,
-  looping over a set of parameters, with the current
-  iteration of parameters being params.
+  Worker function for parallel (joblib) sweeps of the hypergraph
+  triangle-closing rewire-to-same voter model on a simplicial
+  Watts-Strogatz initial hypergraph: builds a WS ring-lattice
+  hypergraph (with each node's neighborhood also independently
+  gaining extra sub-edges with probability p, increasing
+  sigma_SF), runs HG_RewireTriangleSame_Voter for one parameter
+  combination, and pickles the result. Skips the run if its output
+  file already exists.
+
+  NOTE: this call unpacks 4 return values from
+  HG_RewireTriangleSame_Voter, which returns only 3
+  (Proportions, DiscordantCounts, H) — as currently written this
+  raises a ValueError at runtime. Flagging rather than fixing per
+  the current docstring-only task.
+
+  Parameters
+  ----------
+  params : tuple
+    (n, k, rho, alpha, gamma, voting, iteration, p): node count,
+    hyperedge size, initial opinion-1 proportion, rewiring
+    probability, triangle-closure probability, voting rule, run
+    index, and sub-edge inclusion probability.
+
+  Returns
+  -------
+  int
+    0 in all cases. Results are written to a filename derived from
+    params rather than returned directly.
   """
   # Grab parameter values from params list
   n = params[0]; k = params[1]; rho = params[2]; alpha = params[3]; gamma = params[4]; voting = params[5]; iteration = params[6]; p = params[7]
@@ -1885,7 +2179,25 @@ def PC_Simplicial_WS(params):
   return 0
 
 def generate_ER_hypergraph(n, m, k):
-    """Generate k-uniform ER hypergraph"""
+    """
+    Generates a k-uniform Erdos-Renyi hypergraph: m distinct
+    size-k hyperedges, each drawn by sampling k nodes uniformly at
+    random (without replacement within an edge) from n total nodes.
+
+    Parameters
+    ----------
+    n : int
+      Number of nodes.
+    m : int
+      Number of hyperedges to generate.
+    k : int
+      Size of every hyperedge.
+
+    Returns
+    -------
+    H_ER : dict
+      The hyperedges, as {edge_index: nodes (list)}.
+    """
     E = set()
     H_ER = {}
     i = 0
@@ -1902,7 +2214,29 @@ def generate_ER_hypergraph(n, m, k):
 
 def run_single_simulation(params):
     """
-    Run a single simulation for given parameters
+    Worker function for parallel (joblib) sweeps of the hypergraph
+    triangle-closing rewire-to-same voter model on ER hypergraphs:
+    generates a fresh k-uniform ER hypergraph (see
+    generate_ER_hypergraph), runs HG_RewireTriangleSame_Voter for one
+    parameter combination (with a large exit_criteria cap), and
+    pickles only the Proportions/DiscordantCounts trajectories (not
+    the terminal hypergraph). Skips the run if its output file
+    already exists.
+
+    Parameters
+    ----------
+    params : tuple
+      (k, alpha, gamma, voting, n, m, rho, base_dir): hyperedge size,
+      rewiring probability, triangle-closure probability, voting
+      rule, node count, hyperedge count, initial opinion-1
+      proportion, and output directory.
+
+    Returns
+    -------
+    tuple
+      (success, filename, message): success is a bool, filename the
+      output file's basename, and message is 'Already exists',
+      'Success', or the exception string on failure.
     """
     k, alpha, gamma, voting, n, m, rho, base_dir = params
 
@@ -1946,8 +2280,36 @@ def run_single_simulation(params):
 
 def load_single_trajectory_arch(n, m, rho, alpha, gamma, iteration, base_path):
     """
-    Loads a single trajectory file and returns (Proportions, DiscordantCounts).
-    Returns (None, None) for missing or corrupted files.
+    Loads one graph triangle-rewire trajectory file (see
+    PC_G_RewireTriangleSame), from a directory laid out by
+    rho/alpha/gamma subfolders, tolerating a missing or corrupted
+    file.
+
+    Parameters
+    ----------
+    n : int
+      Node count used to locate the file.
+    m : int
+      Edge count used to locate the file.
+    rho : float
+      Initial opinion-1 proportion used to locate the file.
+    alpha : float
+      Rewiring probability used to locate the file.
+    gamma : float
+      Triangle-closure probability used to locate the file.
+    iteration : int
+      Run index used to locate the file.
+    base_path : str
+      Base directory (containing rho/alpha/gamma subfolders) the file
+      is located in.
+
+    Returns
+    -------
+    Proportions : ndarray or None
+      Proportion of opinion-1 nodes at each timestep, or None if the
+      file is missing or corrupted.
+    DiscordantCounts : ndarray or None
+      Proportion of discordant edges at each timestep, or None likewise.
     """
     filename = (
         base_path +
@@ -1981,7 +2343,35 @@ def load_single_trajectory_arch(n, m, rho, alpha, gamma, iteration, base_path):
 
 def create_graph_arch_figure(graph_data, rho, alpha_values, gamma_values, save_path=None, max_points=500):
     """
-    Create 3D arch plot for graph model (K=2)
+    Plots a 3-D "arch" figure for the graph (K=2) triangle-rewire
+    voter model: for each (alpha, gamma) combination, plots the
+    trajectory (minority proportion, alpha, discordant-edge
+    proportion) as a curve in 3-D, colored by gamma, with both the
+    minority-opinion trajectory and its mirror (1 - proportion)
+    drawn.
+
+    Parameters
+    ----------
+    graph_data : dict
+      Maps (alpha, gamma) -> {'Proportions': ..., 'DiscordantCounts': ...}
+      (see load_single_trajectory_arch).
+    rho : float
+      Initial opinion-1 proportion (used only for context; not
+      referenced directly in the plot).
+    alpha_values : list of float
+      Rewiring probability values to plot curves for.
+    gamma_values : list of float
+      Triangle-closure probability values to plot curves for,
+      colored by a viridis colormap.
+    save_path : str or None
+      If given, the figure is saved to this path.
+    max_points : int
+      Unused; accepted for signature compatibility.
+
+    Returns
+    -------
+    fig, ax : matplotlib.figure.Figure, matplotlib.axes.Axes
+      The created figure and its single 3-D axis.
     """
 
     gamma_values = [0.2, 0.4, 0.6000000000000001, 0.8, 1.0]
@@ -2054,6 +2444,33 @@ def create_graph_arch_figure(graph_data, rho, alpha_values, gamma_values, save_p
     return fig, ax
 
 def er_raw_fname(base_path, n, m, rho, alpha, gamma, iteration):
+    """
+    Builds the raw-result filename for one Erdos-Renyi graph
+    triangle-rewire voter model run, in a rho/alpha/gamma subfolder
+    layout.
+
+    Parameters
+    ----------
+    base_path : pathlib.Path or str
+      Base directory the rho/alpha/gamma subfolders live under.
+    n : int
+      Node count.
+    m : int
+      Edge count.
+    rho : float
+      Initial opinion-1 proportion.
+    alpha : float
+      Rewiring probability.
+    gamma : float
+      Triangle-closure probability.
+    iteration : int
+      Run index.
+
+    Returns
+    -------
+    str
+      The full file path.
+    """
     target_dir = (
         base_path
         / str(rho).replace('.', '_')
@@ -2070,6 +2487,39 @@ def er_raw_fname(base_path, n, m, rho, alpha, gamma, iteration):
     return str(target_dir / filename)
 
 def load_er_proportion(base_path, n, m, alphas, gammas, rho, ai, gi, it):
+    """
+    Loads one raw Erdos-Renyi graph triangle-rewire result file (see
+    er_raw_fname) and extracts the terminal minority opinion
+    proportion, tolerating a missing or corrupted file.
+
+    Parameters
+    ----------
+    base_path : pathlib.Path or str
+      Base directory the file is located under.
+    n : int
+      Node count.
+    m : int
+      Edge count.
+    alphas : ndarray
+      Rewiring probability values; alphas[ai] selects the one used.
+    gammas : ndarray
+      Triangle-closure probability values; gammas[gi] selects the one used.
+    rho : float
+      Initial opinion-1 proportion.
+    ai : int
+      Index into alphas.
+    gi : int
+      Index into gammas.
+    it : int
+      Run index.
+
+    Returns
+    -------
+    tuple or None
+      (rho, ai, gi, min(p, 1-p)) on success, where p is the terminal
+      opinion-1 proportion; None if the file is missing or fails to
+      load.
+    """
     path = er_raw_fname(base_path, n, m, rho, alphas[ai], gammas[gi], it)
     if not os.path.isfile(path):
         print("File {path} not found")
@@ -2083,7 +2533,133 @@ def load_er_proportion(base_path, n, m, alphas, gammas, rho, ai, gi, it):
         print(Exception)
         return None
 
+def hg_raw_fname(base_path, n, m, k, rho, alpha, gamma, voting, iteration):
+    """
+    Builds the raw-result filename for one hypergraph triangle-rewire
+    voter model run, the hypergraph analogue of er_raw_fname.
+
+    Parameters
+    ----------
+    base_path : str
+      Directory the file is located in.
+    n : int
+      Node count.
+    m : int
+      Number of hyperedges.
+    k : int
+      Hyperedge size.
+    rho : float
+      Initial proportion of opinion 1.
+    alpha : float
+      Rewiring probability.
+    gamma : float
+      Triangle-closure probability.
+    voting : str
+      Voting rule ('Majority' or 'Proportional').
+    iteration : int
+      Run index.
+
+    Returns
+    -------
+    str
+      The full file path.
+    """
+    return (
+        base_path +
+        f'H_rewire_triangle_same_ER_{n}_{m}_{k}_'
+        f'{str(rho).replace(".","_")}_'
+        f'{str(alpha).replace(".","_")}_'
+        f'{str(gamma).replace(".","_")}_'
+        f'{voting}_{iteration}.pkl'
+    )
+
+def load_hg_er_proportion(base_path, n, m, k, rho, alphas, gammas, voting, ai, gi, iteration):
+    """
+    Loads one raw hypergraph triangle-rewire result file (see
+    hg_raw_fname) and extracts the terminal minority opinion
+    proportion and timesteps-to-consensus, the hypergraph analogue of
+    load_er_proportion.
+
+    Parameters
+    ----------
+    base_path : str
+      Directory the file is located in.
+    n : int
+      Node count.
+    m : int
+      Number of hyperedges.
+    k : int
+      Hyperedge size.
+    rho : float
+      Initial proportion of opinion 1.
+    alphas : ndarray
+      Rewiring probability values; alphas[ai] selects the one used.
+    gammas : ndarray
+      Triangle-closure probability values; gammas[gi] selects the one used.
+    voting : str
+      Voting rule ('Majority' or 'Proportional').
+    ai : int
+      Index into alphas.
+    gi : int
+      Index into gammas.
+    iteration : int
+      Run index.
+
+    Returns
+    -------
+    key : tuple
+      (k, voting, ai, gi, iteration), for use as a dict key.
+    minority_proportion : float or None
+      min(p, 1-p) of the terminal opinion proportion, or None on
+      failure.
+    timer : int or None
+      Timesteps to consensus (or exit), or None on failure.
+    """
+    alpha = alphas[ai]; gamma = gammas[gi]
+    fname = hg_raw_fname(base_path, n, m, k, rho, alpha, gamma, voting, iteration)
+    if not os.path.isfile(fname):
+        return (k, voting, ai, gi, iteration), None, None
+    try:
+        with gzip.open(fname, 'rb') as f:
+            proportion, _, timer, _ = pickle.load(f)
+        term_prop  = float(proportion)
+        term_timer = int(timer)
+        return (k, voting, ai, gi, iteration), min(1-term_prop, term_prop), term_timer
+    except Exception as e:
+        print(f'  Error {fname}: {e}')
+        return (k, voting, ai, gi, iteration), None, None
+
 def plot_er_terminal(er_means, n, m, rhos, TICK_IDX, XLABELS, YLABELS, save_path=None):
+    """
+    Plots a 2x2 grid of terminal minority-opinion-proportion heatmaps
+    across the (alpha, gamma) grid, one panel per initial opinion-1
+    proportion rho, for the Erdos-Renyi graph triangle-rewire model.
+
+    Parameters
+    ----------
+    er_means : dict
+      Maps rho -> 2-D array of mean terminal minority proportion,
+      indexed [gamma, alpha].
+    n : int
+      Node count, shown in the figure title.
+    m : int
+      Edge count, shown in the figure title.
+    rhos : list of float
+      Initial opinion-1 proportions to plot, one panel each (up to 4).
+    TICK_IDX : ndarray
+      Tick positions (into the alpha/gamma grids) for both axes.
+    XLABELS : list of str
+      Tick labels for the alpha (x) axis.
+    YLABELS : list of str
+      Tick labels for the gamma (y) axis.
+    save_path : str or None
+      If given, the figure is saved to this path.
+
+    Returns
+    -------
+    None
+      Displays the figure; saves it to save_path if given.
+    """
     fig, axes = plt.subplots(2, 2, figsize=(12, 10), constrained_layout=True)
 
     for ax, rho in zip(axes.flatten(), rhos):
@@ -2114,11 +2690,66 @@ def plot_er_terminal(er_means, n, m, rhos, TICK_IDX, XLABELS, YLABELS, save_path
     plt.show()
 
 def proc_graph_fname(rho, alpha, gamma, iteration, PROC_G):
+    """
+    Builds the processed-TDA filename for one Erdos-Renyi graph
+    triangle-rewire voter model run.
+
+    Parameters
+    ----------
+    rho : float
+      Initial opinion-1 proportion.
+    alpha : float
+      Rewiring probability.
+    gamma : float
+      Triangle-closure probability.
+    iteration : int
+      Run index.
+    PROC_G : str
+      Directory the file is located in.
+
+    Returns
+    -------
+    str
+      The full file path.
+    """
     rs = str(rho).replace('.', '_')
     return os.path.join(PROC_G,
         f'tda_rho{rs}_a{alpha:.4f}_g{gamma:.4f}_it{iteration}.pkl.gz')
 
 def compute_and_save_graph(n, m, rho, alpha, gamma, iteration, BASE_G, PROC_G):
+    """
+    Computes and caches ComputeResults (Betti numbers, Euler
+    characteristic, simplex counts of the clique complex) for one
+    Erdos-Renyi graph triangle-rewire voter model run, unless already
+    cached or its raw result file is missing.
+
+    Parameters
+    ----------
+    n : int
+      Node count.
+    m : int
+      Edge count.
+    rho : float
+      Initial opinion-1 proportion.
+    alpha : float
+      Rewiring probability.
+    gamma : float
+      Triangle-closure probability.
+    iteration : int
+      Run index.
+    BASE_G : str
+      Directory raw result files are located in.
+    PROC_G : str
+      Directory processed (cached) TDA files are saved to.
+
+    Returns
+    -------
+    str
+      'exists' if already cached, 'missing' if the raw file isn't
+      present, 'done' on success, or 'error: <message>' on failure.
+      The result dict is written to the cache file, not returned
+      directly.
+    """
     pfname = proc_graph_fname(rho, alpha, gamma, iteration, PROC_G)
     if os.path.isfile(pfname):
         return 'exists'
@@ -2146,6 +2777,39 @@ def compute_and_save_graph(n, m, rho, alpha, gamma, iteration, BASE_G, PROC_G):
         return f'error: {e}'
 
 def load_one_graph(rho, alphas, gammas, ai, gi, it):
+    """
+    Loads one cached TDA result (see compute_and_save_graph) for an
+    Erdos-Renyi graph triangle-rewire voter model run, tolerating a
+    missing or corrupted file.
+
+    NOTE: this calls proc_graph_fname with only 4 positional
+    arguments, but proc_graph_fname requires 5 (its final PROC_G
+    argument is not supplied here) — as currently written this
+    raises a TypeError at runtime. Flagging rather than fixing per
+    the current docstring-only task.
+
+    Parameters
+    ----------
+    rho : float
+      Initial opinion-1 proportion.
+    alphas : ndarray
+      Rewiring probability values; alphas[ai] selects the one used.
+    gammas : ndarray
+      Triangle-closure probability values; gammas[gi] selects the one used.
+    ai : int
+      Index into alphas.
+    gi : int
+      Index into gammas.
+    it : int
+      Run index.
+
+    Returns
+    -------
+    tuple or None
+      (rho, ai, gi, result_dict) on success (result_dict as returned
+      by compute_and_save_graph), or None if the file is missing or
+      fails to load.
+    """
     pfname = proc_graph_fname(rho, alphas[ai], gammas[gi], it)
     if not os.path.isfile(pfname):
         return None
@@ -2157,12 +2821,141 @@ def load_one_graph(rho, alphas, gammas, ai, gi, it):
         return None
 
 def gmean(counts_g, sums_g, rho, fld):
+    """
+    Computes an elementwise mean of one field's accumulated sum over
+    its count, for the Erdos-Renyi graph triangle-rewire
+    architecture's rho-keyed accumulators.
+
+    Parameters
+    ----------
+    counts_g : dict
+      Accumulator keyed by rho, each an ndarray of sample counts.
+    sums_g : dict
+      Accumulator keyed by rho, each mapping field names to ndarrays
+      of summed values.
+    rho : float
+      Initial opinion-1 proportion key into counts_g/sums_g.
+    fld : str
+      Field name key into sums_g[rho].
+
+    Returns
+    -------
+    ndarray
+      Elementwise mean, NaN where the count is 0.
+    """
     c = counts_g[rho]
     with np.errstate(invalid='ignore', divide='ignore'):
         return np.where(c > 0, sums_g[rho][fld] / c, np.nan)
 
-def plot_graph_heatmaps_styled(derived_g, CMAP, TICK_IDX, XLABELS, YLABELS, n, m, rho, save_path=None):
+def safe_mean(s, c):
+    """
+    Computes an elementwise mean s/c, returning NaN wherever the
+    count c is 0 rather than raising a divide-by-zero warning/error.
 
+    Parameters
+    ----------
+    s : ndarray
+      Elementwise sum.
+    c : ndarray
+      Elementwise count.
+
+    Returns
+    -------
+    ndarray
+      s/c elementwise, NaN where c <= 0.
+    """
+    with np.errstate(invalid='ignore', divide='ignore'):
+        return np.where(c > 0, s / c, np.nan)
+
+def plot_alpha_gamma_heatmap(ax, mat, alphas, gammas, title, cmap='plasma', vmin=None, vmax=None, norm=None):
+    """
+    Plots a single alpha/gamma heatmap panel with this module's
+    standard axis labeling. If norm is not given, vmin/vmax are used
+    (auto-computed from the finite values of mat wherever they are
+    None) to build a linear Normalize; if norm is given, it takes
+    precedence over vmin/vmax.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+      Axis to draw on.
+    mat : ndarray
+      2-D array to plot, indexed [gamma, alpha].
+    alphas : ndarray
+      Alpha (rewiring rate) grid values, for the x-axis.
+    gammas : ndarray
+      Gamma (triangle-closing) grid values, for the y-axis.
+    title : str
+      Subplot title.
+    cmap : str or Colormap
+      Colormap to use.
+    vmin : float or None
+      Lower color-scale bound; ignored if norm is given.
+    vmax : float or None
+      Upper color-scale bound; ignored if norm is given.
+    norm : matplotlib.colors.Normalize or None
+      Explicit color normalization (e.g. a LogNorm), overriding vmin/vmax.
+
+    Returns
+    -------
+    im : matplotlib.collections.QuadMesh
+      The plotted mesh, e.g. for use with fig.colorbar.
+    """
+    if norm is None:
+        finite = mat[np.isfinite(mat)]
+        if vmin is None and len(finite) > 0:
+            vmin = finite.min()
+        if vmax is None and len(finite) > 0:
+            vmax = finite.max()
+        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+    im = ax.pcolormesh(
+        alphas, gammas, mat,
+        cmap=cmap, shading='auto',
+        norm=norm,
+    )
+    ax.set_xlabel(r'$\alpha$ (rewiring rate)')
+    ax.set_ylabel(r'$\gamma$ (triangle-closing)')
+    ax.set_title(title, pad=6)
+    ax.set_xlim(alphas[0], alphas[-1])
+    ax.set_ylim(gammas[0], gammas[-1])
+    return im
+
+def plot_graph_heatmaps_styled(derived_g, CMAP, TICK_IDX, XLABELS, YLABELS, n, m, rho, save_path=None):
+    """
+    Plots a 3x2 grid of heatmaps across the (alpha, gamma) grid for
+    the Erdos-Renyi graph triangle-rewire model's terminal clique
+    complex: beta_0, beta_1, N_2, N_3, CR_1 - beta_1, and gamma_1
+    (filling efficiency). These quantities are pre-computed by the
+    caller and passed in via derived_g; this function only plots them.
+
+    Parameters
+    ----------
+    derived_g : dict
+      Maps rho -> {label: 2-D array}, indexed [gamma, alpha], for
+      each of the six panel quantities (pre-computed by the caller).
+    CMAP : str or Colormap
+      Colormap to use.
+    TICK_IDX : ndarray
+      Tick positions (into the alpha/gamma grids) for both axes.
+    XLABELS : list of str
+      Tick labels for the alpha (x) axis.
+    YLABELS : list of str
+      Tick labels for the gamma (y) axis.
+    n : int
+      Node count, shown in the figure title.
+    m : int
+      Edge count, shown in the figure title.
+    rho : float
+      Initial opinion-1 proportion; selects derived_g[rho] and is
+      shown in the figure title.
+    save_path : str or None
+      If given, the figure is saved to this path.
+
+    Returns
+    -------
+    None
+      Displays the figure; saves it to save_path if given.
+    """
     panels = [
         (r'$\beta_0$ (components)',                      derived_g[rho][r'$\beta_0$ (components)']),
         (r'$\beta_1$ (tunnels)',                      derived_g[rho][r'$\beta_1$ (tunnels)']),
@@ -2200,20 +2993,82 @@ def plot_graph_heatmaps_styled(derived_g, CMAP, TICK_IDX, XLABELS, YLABELS, n, m
     plt.show()
 
 def raw_fname_baws(BASE_GRAPH, n, m, model, rho, alpha, gamma, iteration):
-    """Path to the individual terminal graph file."""
+    """
+    Builds the raw-result filename for one Barabasi-Albert or
+    Watts-Strogatz graph triangle-rewire voter model run.
+
+    Parameters
+    ----------
+    BASE_GRAPH : str
+      Base directory the model subfolder lives under.
+    n : int
+      Node count.
+    m : int
+      Edge count.
+    model : str
+      Initial graph model, e.g. 'BA' or 'WS'.
+    rho : float
+      Initial opinion-1 proportion.
+    alpha : float
+      Rewiring probability.
+    gamma : float
+      Triangle-closure probability.
+    iteration : int
+      Run index.
+
+    Returns
+    -------
+    str
+      The full file path.
+    """
     return os.path.join(
         BASE_GRAPH, model,
         f'G_{model}_{n}_{m}_'+str(rho).replace('.','_')+'_'+str(alpha).replace('.','_')+'_'+str(gamma).replace('.','_')+'_'+str(iteration)+'.pkl'
     )
 
 def proc_fname_baws(BASE_GRAPH, model, alpha, gamma, iteration):
-    """Path to the saved TDA result for one (model, alpha, gamma, iteration)."""
+    """
+    Builds the processed-TDA filename for one Barabasi-Albert or
+    Watts-Strogatz graph triangle-rewire voter model run, creating
+    its containing directory if needed.
+
+    Parameters
+    ----------
+    BASE_GRAPH : str
+      Base directory the model subfolder lives under.
+    model : str
+      Initial graph model, e.g. 'BA' or 'WS'.
+    alpha : float
+      Rewiring probability.
+    gamma : float
+      Triangle-closure probability.
+    iteration : int
+      Run index.
+
+    Returns
+    -------
+    str
+      The full file path.
+    """
     proc_path = os.path.join(BASE_GRAPH, model, 'proc')
     os.makedirs(proc_path, exist_ok=True)
     return os.path.join(proc_path, f'tda_a{alpha:.4f}_g{gamma:.4f}_it{iteration}.pkl.gz')
 
 def load_raw_graph(path):
-    """Try gzip pickle first, fall back to plain pickle."""
+    """
+    Loads a pickled result file, trying gzip-compressed pickle first
+    and falling back to plain pickle, tolerating any failure.
+
+    Parameters
+    ----------
+    path : str
+      Path to the file to load.
+
+    Returns
+    -------
+    object or None
+      The unpickled contents, or None if both load attempts fail.
+    """
     try:
         with gzip.open(path, 'rb') as f:
             return pickle.load(f)
@@ -2226,6 +3081,40 @@ def load_raw_graph(path):
         return None
 
 def compute_and_save_baws(BASE_GRAPH, n, m, model, rho, alpha, gamma, iteration):
+    """
+    Computes and caches ComputeResults (Betti numbers, Euler
+    characteristic, simplex counts of the clique complex) for one
+    Barabasi-Albert or Watts-Strogatz graph triangle-rewire voter
+    model run, unless already cached or its raw result file is
+    missing.
+
+    Parameters
+    ----------
+    BASE_GRAPH : str
+      Base directory raw and processed files are located under.
+    n : int
+      Node count.
+    m : int
+      Edge count.
+    model : str
+      Initial graph model, e.g. 'BA' or 'WS'.
+    rho : float
+      Initial opinion-1 proportion.
+    alpha : float
+      Rewiring probability.
+    gamma : float
+      Triangle-closure probability.
+    iteration : int
+      Run index.
+
+    Returns
+    -------
+    str
+      'exists' if already cached, 'missing' if the raw file isn't
+      present, 'done' on success, or 'error: <message>' on failure.
+      The result dict is written to the cache file, not returned
+      directly.
+    """
     pfname = proc_fname_baws(BASE_GRAPH, model, alpha, gamma, iteration)
     if os.path.isfile(pfname):
         return 'exists'
@@ -2246,6 +3135,35 @@ def compute_and_save_baws(BASE_GRAPH, n, m, model, rho, alpha, gamma, iteration)
         return f'error: {e}'
 
 def load_one_baws(BASE_GRAPH, alphas, gammas, model, ai, gi, it):
+    """
+    Loads one cached TDA result (see compute_and_save_baws) for a
+    Barabasi-Albert or Watts-Strogatz graph triangle-rewire voter
+    model run, tolerating a missing or corrupted file.
+
+    Parameters
+    ----------
+    BASE_GRAPH : str
+      Base directory the file is located under.
+    alphas : ndarray
+      Rewiring probability values; alphas[ai] selects the one used.
+    gammas : ndarray
+      Triangle-closure probability values; gammas[gi] selects the one used.
+    model : str
+      Initial graph model, e.g. 'BA' or 'WS'.
+    ai : int
+      Index into alphas.
+    gi : int
+      Index into gammas.
+    it : int
+      Run index.
+
+    Returns
+    -------
+    tuple or None
+      (model, ai, gi, result_dict) on success (result_dict as
+      returned by compute_and_save_baws), or None if the file is
+      missing or fails to load.
+    """
     pfname = proc_fname_baws(BASE_GRAPH, model, alphas[ai], gammas[gi], it)
     if not os.path.isfile(pfname):
         return None
@@ -2257,11 +3175,70 @@ def load_one_baws(BASE_GRAPH, alphas, gammas, model, ai, gi, it):
         return None
 
 def gmean_baws(counts_baws, sums_baws, model, fld):
+    """
+    Computes an elementwise mean of one field's accumulated sum over
+    its count, for the BA/WS graph triangle-rewire architecture's
+    model-keyed accumulators.
+
+    Parameters
+    ----------
+    counts_baws : dict
+      Accumulator keyed by model, each an ndarray of sample counts.
+    sums_baws : dict
+      Accumulator keyed by model, each mapping field names to
+      ndarrays of summed values.
+    model : str
+      Initial graph model key into counts_baws/sums_baws, e.g. 'BA'
+      or 'WS'.
+    fld : str
+      Field name key into sums_baws[model].
+
+    Returns
+    -------
+    ndarray
+      Elementwise mean, NaN where the count is 0.
+    """
     c = counts_baws[model]
     with np.errstate(invalid='ignore', divide='ignore'):
         return np.where(c > 0, sums_baws[model][fld] / c, np.nan)
 
 def plot_baws_heatmaps(n, m, rho, derived_baws, CMAP, TICK_IDX, XLABELS, YLABELS, model, save_path=None):
+    """
+    Plots a 3x2 grid of heatmaps across the (alpha, gamma) grid for
+    one initial graph model's (BA or WS) terminal clique complex.
+    The panel quantities are pre-computed by the caller and passed in
+    via derived_baws; this function only plots them.
+
+    Parameters
+    ----------
+    n : int
+      Node count, shown in the figure title.
+    m : int
+      Edge count, shown in the figure title.
+    rho : float
+      Initial opinion-1 proportion, shown in the figure title.
+    derived_baws : dict
+      Maps model -> {label: 2-D array}, indexed [gamma, alpha], for
+      each panel quantity (pre-computed by the caller).
+    CMAP : str or Colormap
+      Colormap to use.
+    TICK_IDX : ndarray
+      Tick positions (into the alpha/gamma grids) for both axes.
+    XLABELS : list of str
+      Tick labels for the alpha (x) axis.
+    YLABELS : list of str
+      Tick labels for the gamma (y) axis.
+    model : str
+      Initial graph model to plot, e.g. 'BA' or 'WS'; selects
+      derived_baws[model] and is shown in the figure title.
+    save_path : str or None
+      If given, the figure is saved to this path.
+
+    Returns
+    -------
+    None
+      Displays the figure; saves it to save_path if given.
+    """
     panels = list(derived_baws[model].items())   # 6 panels
 
     fig, axes = plt.subplots(3, 2, figsize=(10, 11), constrained_layout=True)
@@ -2292,7 +3269,43 @@ def plot_baws_heatmaps(n, m, rho, derived_baws, CMAP, TICK_IDX, XLABELS, YLABELS
     plt.show()
 
 def plot_beta2_comparison(n, m, derived_g, derived_baws, CMAP, TICK_IDX, XLABELS, YLABELS, rho, save_path=None):
+    """
+    Plots beta_2 (voids) heatmaps across the (alpha, gamma) grid side
+    by side for the three initial graph models (ER, WS, BA), sharing
+    one color scale for direct comparison.
 
+    Parameters
+    ----------
+    n : int
+      Node count, shown in the figure title.
+    m : int
+      Edge count, shown in the figure title.
+    derived_g : dict
+      Maps rho -> {label: 2-D array} for the ER model (see
+      plot_graph_heatmaps_styled); must include the beta_2 (voids) key.
+    derived_baws : dict
+      Maps model ('WS', 'BA') -> {label: 2-D array} (see
+      plot_baws_heatmaps); must include the beta_2 (voids) key for each.
+    CMAP : str or Colormap
+      Colormap to use.
+    TICK_IDX : ndarray
+      Tick positions (into the alpha/gamma grids) for both axes.
+    XLABELS : list of str
+      Tick labels for the alpha (x) axis.
+    YLABELS : list of str
+      Tick labels for the gamma (y) axis.
+    rho : float
+      Initial opinion-1 proportion; selects derived_g[rho] and is
+      shown in the figure title.
+    save_path : str or None
+      Unused; accepted for signature compatibility (this function
+      does not save its figure).
+
+    Returns
+    -------
+    None
+      Displays the figure.
+    """
     panels = [
         ('ER (random)', derived_g[rho][r'$\beta_2$ (voids)']),
         ('WS (ring lattice)', derived_baws['WS'][r'$\beta_2$ (voids)']),
@@ -2328,6 +3341,44 @@ def plot_beta2_comparison(n, m, derived_g, derived_baws, CMAP, TICK_IDX, XLABELS
     plt.show()
 
 def load_terminal_one(BASE_GRAPH, n, m, rho, alphas, gammas, model, ai, gi, it):
+    """
+    Loads one raw BA/WS graph triangle-rewire result file (see
+    raw_fname_baws) and extracts terminal minority opinion
+    proportion, discordant-edge proportion, and trajectory length,
+    tolerating a missing or corrupted file.
+
+    Parameters
+    ----------
+    BASE_GRAPH : str
+      Base directory the file is located under.
+    n : int
+      Node count.
+    m : int
+      Edge count.
+    rho : float
+      Initial opinion-1 proportion.
+    alphas : ndarray
+      Rewiring probability values; alphas[ai] selects the one used.
+    gammas : ndarray
+      Triangle-closure probability values; gammas[gi] selects the one used.
+    model : str
+      Initial graph model, e.g. 'BA' or 'WS'.
+    ai : int
+      Index into alphas.
+    gi : int
+      Index into gammas.
+    it : int
+      Run index.
+
+    Returns
+    -------
+    tuple or None
+      (model, ai, gi, minority, discord, length) on success, where
+      minority is min(p, 1-p) of the terminal opinion-1 proportion,
+      discord is the terminal discordant-edge proportion, and length
+      is the trajectory length; None if the file is missing, fails to
+      load, or its contents can't be converted.
+    """
     path = raw_fname_baws(BASE_GRAPH, n, m, model, rho, alphas[ai], gammas[gi], it)
     data = load_raw_graph(path)
     if data is None:
@@ -2342,6 +3393,37 @@ def load_terminal_one(BASE_GRAPH, n, m, rho, alphas, gammas, model, ai, gi, it):
         return None
 
 def plot_terminal_comparison(n, m, RHO, term_means, TICK_IDX, XLABELS, YLABELS,save_path=None):
+    """
+    Plots terminal minority-opinion-proportion heatmaps across the
+    (alpha, gamma) grid side by side for the WS and BA initial graph
+    models.
+
+    Parameters
+    ----------
+    n : int
+      Node count, shown in the figure title.
+    m : int
+      Edge count, shown in the figure title.
+    RHO : float
+      Initial opinion-1 proportion, shown in the figure title.
+    term_means : dict
+      Maps model ('WS', 'BA') -> {r'$\\langle \\rho_{\\min} \\rangle$':
+      2-D array}, indexed [gamma, alpha] (see load_terminal_one).
+    TICK_IDX : ndarray
+      Tick positions (into the alpha/gamma grids) for both axes.
+    XLABELS : list of str
+      Tick labels for the alpha (x) axis.
+    YLABELS : list of str
+      Tick labels for the gamma (y) axis.
+    save_path : str or None
+      Unused; accepted for signature compatibility (this function
+      does not save its figure).
+
+    Returns
+    -------
+    None
+      Displays the figure.
+    """
     fig, axes = plt.subplots(1, 2, figsize=(10, 4.5), constrained_layout=True)
 
     for ax, model in zip(axes, ['WS', 'BA']):
@@ -2369,6 +3451,302 @@ def plot_terminal_comparison(n, m, RHO, term_means, TICK_IDX, XLABELS, YLABELS,s
         rf'Terminal minority proportion'
         rf' --- $N = {n}$, $M = {m}$, $\rho = {RHO}$',
         fontsize=13, fontweight='bold')
+
+def raw_fname_HG_ER_arch(data_base, n, m, k, rho, alpha, gamma, voting, iteration):
+    """
+    Builds the raw-result filename for one hypergraph ER
+    triangle-rewire architecture-comparison run.
+
+    Parameters
+    ----------
+    data_base : str
+      Directory the file is located in.
+    n : int
+      Node count.
+    m : int
+      Number of hyperedges.
+    k : int
+      Hyperedge size.
+    rho : float
+      Initial proportion of opinion 1.
+    alpha : float
+      Rewiring probability.
+    gamma : float
+      Triangle-closure probability.
+    voting : str
+      Voting rule ('Majority' or 'Proportional').
+    iteration : int
+      Run index.
+
+    Returns
+    -------
+    str
+      The full file path.
+    """
+    return (
+        data_base +
+        f'H_rewire_triangle_same_ER_{n}_{m}_{k}_'
+        f'{str(rho).replace(".","_")}_'
+        f'{str(alpha).replace(".","_")}_'
+        f'{str(gamma).replace(".","_")}_'
+        f'{voting}_{iteration}.pkl'
+    )
+
+def proc_fname_HG_ER_arch(proc_base, n, m, k, rho, alpha, gamma, voting, iteration):
+    """
+    Builds the processed-TDA filename for one hypergraph ER
+    triangle-rewire architecture-comparison run.
+
+    Parameters
+    ----------
+    proc_base : str
+      Directory the file is located in.
+    n : int
+      Node count.
+    m : int
+      Number of hyperedges.
+    k : int
+      Hyperedge size.
+    rho : float
+      Initial proportion of opinion 1.
+    alpha : float
+      Rewiring probability.
+    gamma : float
+      Triangle-closure probability.
+    voting : str
+      Voting rule ('Majority' or 'Proportional').
+    iteration : int
+      Run index.
+
+    Returns
+    -------
+    str
+      The full file path.
+    """
+    return (
+        proc_base +
+        f'TDA_ER_{n}_{m}_{k}_'
+        f'{str(rho).replace(".","_")}_'
+        f'{str(alpha).replace(".","_")}_'
+        f'{str(gamma).replace(".","_")}_'
+        f'{voting}_{iteration}.pkl'
+    )
+
+def downward_closure(H, max_dim):
+    """
+    Builds all simplices in the downward closure of hypergraph H up
+    to dimension max_dim.
+
+    Parameters
+    ----------
+    H : dict
+      Hypergraph as {edge_id: nodes}.
+    max_dim : int
+      Maximum simplex dimension to include.
+
+    Returns
+    -------
+    simplices : list of set
+      One set per dimension 0..max_dim; simplices[dim] holds that
+      dimension's simplices, each a sorted tuple of node ids.
+    """
+    simplices = [set() for _ in range(max_dim + 1)]
+    for nodes in H.values():
+        nodes = sorted(nodes)
+        # include subsets of size 1..(max_dim+1)
+        for size in range(1, min(len(nodes) + 1, max_dim + 2)):
+            for subset in combinations(nodes, size):
+                simplices[size - 1].add(subset)
+    return simplices
+
+def compute_tda(H, max_dim=3):
+    """
+    Builds a dimension-filtered simplicial complex from hypergraph H
+    (via downward_closure) and computes its terminal Betti numbers
+    and simplex counts, using a dionysus filtration where filtration
+    time equals simplex dimension.
+
+    Parameters
+    ----------
+    H : dict
+      Hypergraph as {edge_id: nodes}.
+    max_dim : int
+      Maximum simplex dimension to include (default 3, i.e. up to
+      tetrahedra).
+
+    Returns
+    -------
+    dict
+      Keys 'b0', 'b1', 'b2' (terminal Betti numbers, counted as
+      infinite-persistence bars) and 'N0', 'N1', 'N2', 'N3' (simplex
+      counts by dimension).
+    """
+    simplices = downward_closure(H, max_dim)
+
+    # build dionysus filtration: time = dimension
+    f = d.Filtration()
+    for dim, sset in enumerate(simplices):
+        for s in sset:
+            f.append(d.Simplex(list(s), float(dim)))
+    f.sort()
+
+    # persistent homology
+    m    = d.homology_persistence(f)
+    dgms = d.init_diagrams(m, f)
+
+    # terminal Betti numbers = count of infinite bars in each diagram
+    inf = float('inf')
+    b = [0, 0, 0]
+    for dim in range(3):
+        if dim < len(dgms):
+            b[dim] = sum(1 for pt in dgms[dim] if pt.death == inf)
+
+    counts = [len(s) for s in simplices]   # N0, N1, N2, N3
+    while len(counts) < 4:
+        counts.append(0)
+
+    return {
+        'b0': b[0], 'b1': b[1], 'b2': b[2],
+        'N0': counts[0], 'N1': counts[1],
+        'N2': counts[2], 'N3': counts[3],
+    }
+
+def process_and_save_HG_ER_arch(data_base, proc_base, n, m, k, rho, alphas, gammas, voting, ai, gi, iteration, max_dim=3):
+    """
+    Computes and caches the TDA result (see compute_tda) for one
+    hypergraph ER triangle-rewire architecture-comparison run, unless
+    already cached or its raw result file is missing.
+
+    Parameters
+    ----------
+    data_base : str
+      Directory raw result files are located in.
+    proc_base : str
+      Directory processed (cached) TDA files are saved to.
+    n : int
+      Node count.
+    m : int
+      Number of hyperedges.
+    k : int
+      Hyperedge size.
+    rho : float
+      Initial proportion of opinion 1.
+    alphas : ndarray
+      Rewiring probability values; alphas[ai] selects the one used.
+    gammas : ndarray
+      Triangle-closure probability values; gammas[gi] selects the one used.
+    voting : str
+      Voting rule ('Majority' or 'Proportional').
+    ai : int
+      Index into alphas.
+    gi : int
+      Index into gammas.
+    iteration : int
+      Run index.
+    max_dim : int
+      Maximum simplex dimension to include, passed to compute_tda.
+
+    Returns
+    -------
+    None
+      Writes the TDA result to a processed-cache file; prints an
+      error message on failure. Returns early (no-op) if the cache
+      file already exists or the raw file is missing.
+    """
+    alpha = alphas[ai]; gamma = gammas[gi]
+    pfname = proc_fname_HG_ER_arch(proc_base, n, m, k, rho, alpha, gamma, voting, iteration)
+    if os.path.isfile(pfname):
+        return  # already processed
+
+    rfname = raw_fname_HG_ER_arch(data_base, n, m, k, rho, alpha, gamma, voting, iteration)
+    if not os.path.isfile(rfname):
+        return
+
+    try:
+        with gzip.open(rfname, 'rb') as f:
+            _, _, _, H = pickle.load(f)
+        result = compute_tda(H, max_dim=max_dim)
+        with gzip.open(pfname, 'wb') as f:
+            pickle.dump(result, f)
+    except Exception as e:
+        print(f'  Error [{k}, a={alpha:.2f}, g={gamma:.2f}, {voting}, {iteration}]: {e}')
+
+def load_HG_ER_arch_tda(proc_base, n, m, k, rho, alphas, gammas, voting, ai, gi, iteration):
+    """
+    Loads one cached TDA result (see process_and_save_HG_ER_arch) for
+    a hypergraph ER triangle-rewire architecture-comparison run,
+    tolerating a missing or corrupted file.
+
+    Parameters
+    ----------
+    proc_base : str
+      Directory processed (cached) TDA files are located in.
+    n : int
+      Node count.
+    m : int
+      Number of hyperedges.
+    k : int
+      Hyperedge size.
+    rho : float
+      Initial proportion of opinion 1.
+    alphas : ndarray
+      Rewiring probability values; alphas[ai] selects the one used.
+    gammas : ndarray
+      Triangle-closure probability values; gammas[gi] selects the one used.
+    voting : str
+      Voting rule ('Majority' or 'Proportional').
+    ai : int
+      Index into alphas.
+    gi : int
+      Index into gammas.
+    iteration : int
+      Run index.
+
+    Returns
+    -------
+    tuple or None
+      (k, ai, gi, voting, result_dict) on success (result_dict as
+      returned by compute_tda), or None if the file is missing or
+      fails to load.
+    """
+    alpha  = alphas[ai]; gamma = gammas[gi]
+    pfname = proc_fname_HG_ER_arch(proc_base, n, m, k, rho, alpha, gamma, voting, iteration)
+    if not os.path.isfile(pfname):
+        return None
+    try:
+        with gzip.open(pfname, 'rb') as f:
+            res = pickle.load(f)
+        return (k, ai, gi, voting, res)
+    except Exception:
+        return None
+
+def smean_HG_ER_arch(k, v, fld, counts, sums):
+    """
+    Computes an elementwise mean of one field's accumulated sum over
+    its count, for the hypergraph ER triangle-rewire architecture
+    comparison's nested-dict accumulators.
+
+    Parameters
+    ----------
+    k : object
+      Hyperedge-size key into counts/sums.
+    v : object
+      Voting-rule key into counts[k]/sums[k].
+    fld : str
+      Field name key into sums[k][v].
+    counts : dict
+      Nested accumulator, counts[k][v] an ndarray of sample counts.
+    sums : dict
+      Nested accumulator, sums[k][v][fld] an ndarray of summed values.
+
+    Returns
+    -------
+    ndarray
+      Elementwise mean, NaN where the count is 0.
+    """
+    c = counts[k][v]
+    with np.errstate(invalid='ignore', divide='ignore'):
+        return np.where(c > 0, sums[k][v][fld] / c, np.nan)
 
 def load_single_file(filepath):
     """Load a single pickle file"""
@@ -2492,11 +3870,122 @@ def create_HG_arch_figure_pair(all_data, k_value, save_path=None):
 
     return fig
 
-def compute_and_save_HG(k, alphas, gammas, ai, gi, it):
-    pfname = proc_fname(k, ai, gi, it)
+def raw_fname_simplicial_WS(base_s, n, k, rho, psub, alpha, gamma, voting, iteration):
+    """
+    Builds the raw-result filename for one simplicial Watts-Strogatz
+    hypergraph voter model run.
+
+    Parameters
+    ----------
+    base_s : str
+      Directory the file is located in.
+    n : int
+      Node count.
+    k : int
+      Hyperedge size.
+    rho : float
+      Initial proportion of opinion 1.
+    psub : float
+      Sub-edge inclusion probability.
+    alpha : float
+      Rewiring probability.
+    gamma : float
+      Triangle-closure probability.
+    voting : str
+      Voting rule ('Majority' or 'Proportional').
+    iteration : int
+      Run index.
+
+    Returns
+    -------
+    str
+      The full file path.
+    """
+    return os.path.join(base_s,
+        f'WS_Simplicial_{n}_{k}_'
+        f'{str(rho).replace(".","_")}_'
+        f'{str(alpha).replace(".","_")}_'
+        f'{str(gamma).replace(".","_")}_'
+        f'{str(psub).replace(".","_")}_'
+        f'{voting}_{iteration}.pkl')
+
+def proc_fname_simplicial_WS(proc_s, n, k, psub, ai, gi, iteration):
+    """
+    Builds the processed-TDA filename for one simplicial
+    Watts-Strogatz hypergraph voter model run.
+
+    Parameters
+    ----------
+    proc_s : str
+      Directory the file is located in.
+    n : int
+      Node count.
+    k : int
+      Hyperedge size.
+    psub : float
+      Sub-edge inclusion probability.
+    ai : int
+      Index into the rewiring-probability grid.
+    gi : int
+      Index into the triangle-closure-probability grid.
+    iteration : int
+      Run index.
+
+    Returns
+    -------
+    str
+      The full file path.
+    """
+    return os.path.join(proc_s,
+        f'proc_{n}_{k}_psub{str(psub).replace(".","_")}_'
+        f'a{ai}_g{gi}_it{iteration}.pkl.gz')
+
+def compute_and_save_HG(base_s, proc_s, n, k, rho, alphas, gammas, voting, psub, ai, gi, iteration):
+    """
+    Computes and caches sigma_SF, sigma_ES, and Betti/simplex-count
+    TDA results (via ComputeHGResults, downward closure) for one
+    simplicial Watts-Strogatz hypergraph voter model run, unless
+    already cached or its raw result file is missing.
+
+    Parameters
+    ----------
+    base_s : str
+      Directory raw result files are located in.
+    proc_s : str
+      Directory processed (cached) TDA files are saved to.
+    n : int
+      Node count.
+    k : int
+      Hyperedge size.
+    rho : float
+      Initial proportion of opinion 1.
+    alphas : ndarray
+      Rewiring probability values; alphas[ai] selects the one used.
+    gammas : ndarray
+      Triangle-closure probability values; gammas[gi] selects the one used.
+    voting : str
+      Voting rule ('Majority' or 'Proportional').
+    psub : float
+      Sub-edge inclusion probability.
+    ai : int
+      Index into alphas.
+    gi : int
+      Index into gammas.
+    iteration : int
+      Run index.
+
+    Returns
+    -------
+    str
+      'exists' if already cached, 'missing' if the raw file isn't
+      present, 'done' on success, or 'error: <message>' on failure.
+      The result dict is written to the cache file, not returned
+      directly.
+    """
+    pfname = proc_fname_simplicial_WS(proc_s, n, k, psub, ai, gi, iteration)
     if os.path.isfile(pfname):
         return 'exists'
-    rpath = raw_fname(k, alphas[ai], gammas[gi], it)
+    rpath = raw_fname_simplicial_WS(base_s, n, k, rho, psub, alphas[ai], gammas[gi], voting, iteration)
     if not os.path.isfile(rpath):
         return 'missing'
     try:
@@ -2509,10 +3998,8 @@ def compute_and_save_HG(k, alphas, gammas, ai, gi, it):
         tda  = ComputeHGResults(H)          # ← downward closure, not clique
         cnts = tda[4] if tda[4] is not None else []
 
-        es_result = Get_Simpliciality_ES(H, minDim=2, maxDim=np.inf)
-        es        = float(es_result[0])
-        sf_result = Get_Simpliciality_SF(H, minDim=2, maxDim=np.inf)
-        sf        = float(sf_result[0])
+        sf = float(Get_Simpliciality_SF(H, minDim=2, maxDim=np.inf)[0])
+        es = float(Get_Simpliciality_ES(H, minDim=2, maxDim=np.inf))
 
         out = {
             'proportion': proportion,
@@ -2532,8 +4019,118 @@ def compute_and_save_HG(k, alphas, gammas, ai, gi, it):
     except Exception as e:
         return f'error: {e}'
 
+def load_simplicial_WS_tda(proc_s, n, k, psub, ai, gi, iteration):
+    """
+    Loads one cached TDA result (see compute_and_save_HG) for a
+    simplicial Watts-Strogatz hypergraph voter model run, tolerating
+    a missing or corrupted file.
+
+    Parameters
+    ----------
+    proc_s : str
+      Directory processed (cached) TDA files are located in.
+    n : int
+      Node count.
+    k : int
+      Hyperedge size.
+    psub : float
+      Sub-edge inclusion probability.
+    ai : int
+      Index into the rewiring-probability grid.
+    gi : int
+      Index into the triangle-closure-probability grid.
+    iteration : int
+      Run index.
+
+    Returns
+    -------
+    tuple or None
+      (k, psub, ai, gi, result_dict) on success, or None if the file
+      is missing or fails to load.
+    """
+    pfname = proc_fname_simplicial_WS(proc_s, n, k, psub, ai, gi, iteration)
+    if not os.path.isfile(pfname):
+        return None
+    try:
+        with gzip.open(pfname, 'rb') as f:
+            res = pickle.load(f)
+        return (k, psub, ai, gi, res)
+    except Exception:
+        return None
+
+def smean_simplicial_WS(k, psub, fld, counts, sums):
+    """
+    Computes an elementwise mean of one field's accumulated sum over
+    its count, for the simplicial Watts-Strogatz hypergraph
+    accumulators keyed by (k, psub) tuples.
+
+    Parameters
+    ----------
+    k : object
+      Hyperedge-size component of the (k, psub) key into counts/sums.
+    psub : object
+      Sub-edge-probability component of the (k, psub) key.
+    fld : str
+      Field name key into sums[(k, psub)].
+    counts : dict
+      Accumulator keyed by (k, psub) tuples, each an ndarray of
+      sample counts.
+    sums : dict
+      Accumulator keyed by (k, psub) tuples, each mapping field names
+      to ndarrays of summed values.
+
+    Returns
+    -------
+    ndarray
+      Elementwise mean, NaN where the count is 0.
+    """
+    c = counts[(k, psub)]
+    with np.errstate(invalid='ignore', divide='ignore'):
+        return np.where(c > 0, sums[(k, psub)][fld] / c, np.nan)
+
 def plot_simplicial_heatmaps(n, rho, derived, CMAP, XLABELS, YLABELS, TICK_A, TICK_G,
                              k, psub, save_path=None):
+    """
+    Plots a grid of heatmaps across the (alpha, gamma) grid for one
+    (hyperedge size, sub-edge probability) combination of the
+    simplicial Watts-Strogatz hypergraph voter model (e.g. sigma_SF,
+    sigma_ES, beta_1, and terminal minority proportion). The panel
+    quantities are pre-computed by the caller and passed in via
+    derived; this function only plots them.
+
+    Parameters
+    ----------
+    n : int
+      Node count, shown in the figure title.
+    rho : float
+      Initial opinion-1 proportion, shown in the figure title.
+    derived : dict
+      Maps (k, psub) -> {label: 2-D array}, indexed [gamma, alpha],
+      for each panel quantity (pre-computed by the caller).
+    CMAP : str or Colormap
+      Colormap to use.
+    XLABELS : list of str
+      Tick labels for the alpha (x) axis.
+    YLABELS : list of str
+      Tick labels for the gamma (y) axis.
+    TICK_A : ndarray
+      Tick positions into the alpha grid.
+    TICK_G : ndarray
+      Tick positions into the gamma grid.
+    k : int
+      Hyperedge size; selects derived[(k, psub)] and is shown in the
+      figure title.
+    psub : float
+      Sub-edge inclusion probability; selects derived[(k, psub)] and
+      is shown in the figure title.
+    save_path : str or None
+      If given, the figure is saved to this path.
+
+    Returns
+    -------
+    None
+      Displays the figure; saves it to save_path if given.
+    """
     panels   = list(derived[(k, psub)].items())
     n_panels = len(panels)
     n_cols, n_rows = 2, (n_panels + 1) // 2
